@@ -7,7 +7,8 @@ const { Pool } = require("pg");
 const PORT = process.env.PORT || 4000;
 const JWT_SECRET = process.env.JWT_SECRET;
 const DATABASE_URL = process.env.DATABASE_URL;
-const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
 const FRONTEND_ORIGINS = (process.env.FRONTEND_ORIGIN || "")
   .split(",")
   .map((s) => s.trim())
@@ -172,26 +173,23 @@ app.put("/api/data", requireAuth, async (req, res) => {
   }
 });
 
-/* ---------------- smart import (AI extraction) ---------------- */
+/* ---------------- smart import (AI extraction via Gemini) ---------------- */
 
 const MAX_FILE_BYTES = 8 * 1024 * 1024; // ~8MB per file, base64 included
 
-function fileToContentBlock(file, label) {
+function fileToGeminiPart(file, label) {
   // file: { mediaType, base64 }
   if (!file || !file.base64 || !file.mediaType) return null;
   if (file.base64.length > MAX_FILE_BYTES) throw new Error(`${label} file is too large. Please use a file under ~6MB.`);
-  if (file.mediaType === "application/pdf") {
-    return { type: "document", source: { type: "base64", media_type: "application/pdf", data: file.base64 } };
-  }
-  if (file.mediaType.startsWith("image/")) {
-    return { type: "image", source: { type: "base64", media_type: file.mediaType, data: file.base64 } };
+  if (file.mediaType === "application/pdf" || file.mediaType.startsWith("image/")) {
+    return { inline_data: { mime_type: file.mediaType, data: file.base64 } };
   }
   throw new Error(`${label} must be a PDF, JPG, or PNG.`);
 }
 
 app.post("/api/import/analyze", requireAuth, async (req, res) => {
   try {
-    if (!ANTHROPIC_API_KEY) {
+    if (!GEMINI_API_KEY) {
       return res.status(503).json({ error: "Smart Import isn't set up yet. Please try again later." });
     }
     const { syllabusFile, datesheetFile } = req.body || {};
@@ -199,19 +197,18 @@ app.post("/api/import/analyze", requireAuth, async (req, res) => {
       return res.status(400).json({ error: "Please upload at least one document." });
     }
 
-    const content = [];
+    const parts = [];
     try {
-      const dsBlock = fileToContentBlock(datesheetFile, "Date sheet");
-      if (dsBlock) { content.push({ type: "text", text: "This document is the DATE SHEET (exam schedule):" }); content.push(dsBlock); }
-      const syBlock = fileToContentBlock(syllabusFile, "Syllabus");
-      if (syBlock) { content.push({ type: "text", text: "This document is the SYLLABUS (chapters/topics):" }); content.push(syBlock); }
+      const dsPart = fileToGeminiPart(datesheetFile, "Date sheet");
+      if (dsPart) { parts.push({ text: "This document is the DATE SHEET (exam schedule):" }); parts.push(dsPart); }
+      const syPart = fileToGeminiPart(syllabusFile, "Syllabus");
+      if (syPart) { parts.push({ text: "This document is the SYLLABUS (chapters/topics):" }); parts.push(syPart); }
     } catch (fileErr) {
       return res.status(400).json({ error: fileErr.message });
     }
 
     const today = new Date().toISOString().slice(0, 10);
-    content.push({
-      type: "text",
+    parts.push({
       text:
         `Extract academic schedule information from the document(s) above. ` +
         `If both a date sheet and a syllabus are provided, match each subject in the syllabus to its exam date/time in the date sheet, ` +
@@ -222,31 +219,29 @@ app.post("/api/import/analyze", requireAuth, async (req, res) => {
         `Include every subject you can identify from either document, even if some fields are null. Keep topic names short and specific (chapter/unit/section titles).`,
     });
 
-    const aiRes = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": ANTHROPIC_API_KEY,
-        "anthropic-version": "2023-06-01",
-      },
-      body: JSON.stringify({
-        model: "claude-sonnet-4-6",
-        max_tokens: 4000,
-        messages: [{ role: "user", content }],
-      }),
-    });
+    const aiRes = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [{ role: "user", parts }],
+          generationConfig: { temperature: 0.2, responseMimeType: "application/json" },
+        }),
+      }
+    );
 
     if (!aiRes.ok) {
       const errText = await aiRes.text().catch(() => "");
-      console.error("Anthropic API error", aiRes.status, errText);
+      console.error("Gemini API error", aiRes.status, errText);
       return res.status(502).json({ error: "Couldn't analyze your documents right now. Please try again." });
     }
 
     const aiJson = await aiRes.json();
-    const textBlock = (aiJson.content || []).find((b) => b.type === "text");
-    if (!textBlock) return res.status(502).json({ error: "The AI didn't return a readable response. Please try again." });
+    const textOut = aiJson?.candidates?.[0]?.content?.parts?.map((p) => p.text).filter(Boolean).join("") || "";
+    if (!textOut) return res.status(502).json({ error: "The AI didn't return a readable response. Please try again." });
 
-    let cleaned = textBlock.text.trim();
+    let cleaned = textOut.trim();
     cleaned = cleaned.replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/```\s*$/i, "").trim();
 
     let parsed;

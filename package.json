@@ -1,8 +1,8 @@
 {
   "name": "examflow-api",
-  "version": "2.0.0",
+  "version": "3.0.0",
   "private": true,
-  "description": "ExamFlow anonymous analytics + Smart Import (Gemini) API",
+  "description": "ExamFlow accounts, sync, analytics, and Smart Import (Gemini) API",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
@@ -11,9 +11,11 @@
     "node": ">=18"
   },
   "dependencies": {
+    "bcryptjs": "^2.4.3",
     "cors": "^2.8.5",
     "express": "^4.19.2",
     "express-rate-limit": "^7.4.0",
+    "jsonwebtoken": "^9.0.2",
     "pg": "^8.12.0"
   }
 }

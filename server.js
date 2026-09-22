@@ -79,6 +79,23 @@ async function initDb() {
     );
   `);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_feedback_time ON feedback(created_at);`);
+  // Turns a text date into a date, or NULL if it isn't a valid date (so one bad value can't break admin reports).
+  await pool.query(`
+    CREATE OR REPLACE FUNCTION ef_safe_date(t text) RETURNS date
+    LANGUAGE plpgsql IMMUTABLE SET search_path = '' AS $fn$
+    BEGIN
+      IF t IS NULL OR t !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}' THEN RETURN NULL; END IF;
+      RETURN substr(t, 1, 10)::date;
+    EXCEPTION WHEN others THEN RETURN NULL;
+    END $fn$;
+  `);
+  await pool.query(`REVOKE ALL ON FUNCTION ef_safe_date(text) FROM PUBLIC;`);
+  await pool.query(`
+    DO $do$ BEGIN
+      IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN REVOKE ALL ON FUNCTION ef_safe_date(text) FROM anon; END IF;
+      IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN REVOKE ALL ON FUNCTION ef_safe_date(text) FROM authenticated; END IF;
+    END $do$;
+  `);
 }
 
 // Records that a logged-in user was active. Throttled to one write per user per 5 minutes.
@@ -142,6 +159,7 @@ function requireAuth(req, res, next) {
   try {
     const payload = jwt.verify(token, JWT_SECRET);
     req.userId = payload.sub;
+    req.tokenPayload = payload;
     touchActive(req.userId);
     next();
   } catch (e) {
@@ -466,7 +484,7 @@ app.post("/api/import/analyze", importLimiter, optionalAuth, async (req, res) =>
 
 /* ---------------- admin (read-only analytics) ---------------- */
 // Access is decided by the server from the database (users.is_admin), never by anything the browser sends.
-// Only accounts marked is_admin = true in the database can use these routes.
+// Every route below is read-only: none of them modify student data.
 
 function requireAdmin(req, res, next) {
   requireAuth(req, res, async () => {
@@ -484,208 +502,646 @@ function requireAdmin(req, res, next) {
   });
 }
 
-// Timezone used for "today" and daily charts.
+// Timezone used for "today", upcoming/past and daily charts.
 const ADMIN_TZ = "Asia/Kolkata";
+const TODAY = `(now() AT TIME ZONE '${ADMIN_TZ}')::date`;
+const FRONTEND_URL = FRONTEND_ORIGINS[0] || "https://examflow-1f03.onrender.com";
 
-// Expands each user's saved study data into exams, syllabus topics (chapters) and planned study sessions.
-const STUDY_DATA_CTE = `
+// Expands each student's saved study data (one JSON document per student) into rows:
+//   ex = exams, ch = syllabus topics (chapters), se = planned study sessions (planner tasks).
+const STUDY_CTE = `
   ex AS (
-    SELECT ud.user_id, e FROM user_data ud,
-      jsonb_array_elements(CASE WHEN jsonb_typeof(ud.data->'exams') = 'array' THEN ud.data->'exams' ELSE '[]'::jsonb END) e
+    SELECT ud.user_id,
+           e->>'id' AS exam_id,
+           NULLIF(btrim(e->>'subject'), '') AS subject,
+           ef_safe_date(e->>'examDate') AS exam_date,
+           NULLIF(e->>'priority', '') AS priority,
+           CASE WHEN jsonb_typeof(e->'chapters') = 'array' THEN e->'chapters' ELSE '[]'::jsonb END AS chapters
+    FROM user_data ud,
+         jsonb_array_elements(CASE WHEN jsonb_typeof(ud.data->'exams') = 'array' THEN ud.data->'exams' ELSE '[]'::jsonb END) e
+    WHERE jsonb_typeof(e) = 'object'
   ),
   ch AS (
-    SELECT ex.user_id, c FROM ex,
-      jsonb_array_elements(CASE WHEN jsonb_typeof(e->'chapters') = 'array' THEN e->'chapters' ELSE '[]'::jsonb END) c
+    SELECT ex.user_id, ex.exam_id, ex.subject,
+           c->>'id' AS chapter_id,
+           NULLIF(btrim(c->>'name'), '') AS name,
+           NULLIF(c->>'difficulty', '') AS difficulty,
+           COALESCE(c->>'status' = 'completed' OR c->>'completed' = 'true', false) AS done,
+           (COALESCE(btrim(c->>'notes'), '') <> '') AS has_note,
+           CASE WHEN c->>'estMinutes' ~ '^[0-9]+$' THEN (c->>'estMinutes')::int END AS est_minutes
+    FROM ex, jsonb_array_elements(ex.chapters) c
+    WHERE jsonb_typeof(c) = 'object'
   ),
   se AS (
-    SELECT ud.user_id, s FROM user_data ud,
-      jsonb_array_elements(CASE WHEN jsonb_typeof(ud.data->'sessions') = 'array' THEN ud.data->'sessions' ELSE '[]'::jsonb END) s
+    SELECT ud.user_id,
+           s->>'id' AS session_id,
+           s->>'examId' AS exam_id,
+           s->>'chapterId' AS chapter_id,
+           NULLIF(btrim(s->>'chapterName'), '') AS chapter_name,
+           NULLIF(btrim(s->>'subject'), '') AS subject,
+           ef_safe_date(s->>'date') AS due_date,
+           NULLIF(s->>'start', '') AS start_time,
+           NULLIF(s->>'end', '') AS end_time,
+           COALESCE(s->>'completed' = 'true', false) AS done
+    FROM user_data ud,
+         jsonb_array_elements(CASE WHEN jsonb_typeof(ud.data->'sessions') = 'array' THEN ud.data->'sessions' ELSE '[]'::jsonb END) s
+    WHERE jsonb_typeof(s) = 'object'
   )`;
-const TOPIC_DONE = `(c->>'status' = 'completed' OR c->>'completed' = 'true')`;
-const TOPIC_HAS_NOTE = `(COALESCE(btrim(c->>'notes'), '') <> '')`;
-const SESSION_DONE = `(s->>'completed' = 'true')`;
 
+// Last time each student did anything we can see: logged-in API use, saving study data, or a tracked action.
+const SEEN_CTE = `
+  seen AS (
+    SELECT u.id AS user_id,
+           GREATEST(u.last_active_at, ud.updated_at, ev.last_ev) AS last_seen
+    FROM users u
+    LEFT JOIN user_data ud ON ud.user_id = u.id
+    LEFT JOIN (
+      SELECT user_id, MAX(created_at) AS last_ev FROM events
+      WHERE user_id IS NOT NULL AND event_type NOT IN ('admin_panel_viewed', 'user_registered')
+      GROUP BY user_id
+    ) ev ON ev.user_id = u.id
+  )`;
+
+const TASK_STATUS = `CASE WHEN se.done THEN 'completed' WHEN se.due_date < ${TODAY} THEN 'overdue' ELSE 'pending' END`;
+const EXAM_STATUS = `CASE WHEN ex.exam_date IS NULL THEN 'no_date' WHEN ex.exam_date < ${TODAY} THEN 'past' ELSE 'upcoming' END`;
+
+const num = (v) => Number(v || 0);
+const clampInt = (v, def, min, max) => Math.min(max, Math.max(min, Number.parseInt(v, 10) || def));
+const isoDate = (v) => (typeof v === "string" && /^\d{4}-\d{2}-\d{2}$/.test(v) ? v : null);
+const cleanText = (v, max = 100) => (typeof v === "string" ? v.trim().slice(0, max) : "");
+
+function adminError(res, what, e) {
+  console.error(`admin ${what} error`, e);
+  res.status(500).json({ error: `Unable to load ${what}. Please try again.` });
+}
+
+/* ---- overview ---- */
 app.get("/api/admin/overview", requireAdmin, async (req, res) => {
   try {
-    const [users, devices, study, events, fb] = await Promise.all([
+    const [users, devices, study, fb] = await Promise.all([
       pool.query(`
+        WITH ${SEEN_CTE}
         SELECT
           COUNT(*) AS total,
-          COUNT(*) FILTER (WHERE created_at >= date_trunc('day', now() AT TIME ZONE '${ADMIN_TZ}') AT TIME ZONE '${ADMIN_TZ}') AS new_today,
-          COUNT(*) FILTER (WHERE created_at >= now() - interval '7 days') AS new_7d,
-          COUNT(*) FILTER (WHERE created_at >= now() - interval '30 days') AS new_30d,
-          COUNT(*) FILTER (WHERE last_active_at >= now() - interval '1 day') AS active_1d,
-          COUNT(*) FILTER (WHERE last_active_at >= now() - interval '7 days') AS active_7d,
-          COUNT(*) FILTER (WHERE last_active_at >= now() - interval '30 days') AS active_30d
-        FROM users`),
+          COUNT(*) FILTER (WHERE (u.created_at AT TIME ZONE '${ADMIN_TZ}')::date = ${TODAY}) AS new_today,
+          COUNT(*) FILTER (WHERE u.created_at >= now() - interval '7 days') AS new_7d,
+          COUNT(*) FILTER (WHERE u.created_at >= now() - interval '30 days') AS new_30d,
+          COUNT(*) FILTER (WHERE seen.last_seen >= now() - interval '1 day') AS active_1d,
+          COUNT(*) FILTER (WHERE seen.last_seen >= now() - interval '7 days') AS active_7d,
+          COUNT(*) FILTER (WHERE seen.last_seen >= now() - interval '30 days') AS active_30d
+        FROM users u JOIN seen ON seen.user_id = u.id`),
       pool.query(`
-        SELECT
-          COUNT(DISTINCT device_id) AS ever,
-          COUNT(DISTINCT device_id) FILTER (WHERE created_at >= now() - interval '1 day') AS d1,
-          COUNT(DISTINCT device_id) FILTER (WHERE created_at >= now() - interval '7 days') AS d7,
-          COUNT(DISTINCT device_id) FILTER (WHERE created_at >= now() - interval '30 days') AS d30
-        FROM events WHERE device_id IS NOT NULL`),
+        SELECT COUNT(DISTINCT device_id) AS ever,
+               COUNT(DISTINCT device_id) FILTER (WHERE created_at >= now() - interval '1 day') AS d1,
+               COUNT(DISTINCT device_id) FILTER (WHERE created_at >= now() - interval '7 days') AS d7
+        FROM events WHERE device_id IS NOT NULL AND event_type <> 'admin_panel_viewed'`),
       pool.query(`
-        WITH ${STUDY_DATA_CTE}
+        WITH ${STUDY_CTE},
+        exam_topics AS (SELECT user_id, exam_id, COUNT(*) AS n, COUNT(*) FILTER (WHERE done) AS d FROM ch GROUP BY user_id, exam_id)
         SELECT
           (SELECT COUNT(*) FROM ex) AS exams,
+          (SELECT COUNT(*) FROM ex WHERE exam_date >= ${TODAY}) AS upcoming,
+          (SELECT COUNT(*) FROM ex WHERE exam_date < ${TODAY}) AS past,
+          (SELECT COUNT(*) FROM exam_topics WHERE n > 0 AND n = d) AS syllabus_complete,
           (SELECT COUNT(*) FROM ch) AS topics,
-          (SELECT COUNT(*) FROM ch WHERE ${TOPIC_DONE}) AS topics_done,
-          (SELECT COUNT(*) FROM ch WHERE ${TOPIC_HAS_NOTE}) AS notes,
-          (SELECT COUNT(*) FROM se) AS sessions,
-          (SELECT COUNT(*) FROM se WHERE ${SESSION_DONE}) AS sessions_done,
-          (SELECT COUNT(DISTINCT user_id) FROM ex) AS users_with_exams`),
-      pool.query(`SELECT event_type, COUNT(*) AS n FROM events GROUP BY event_type`),
+          (SELECT COUNT(*) FROM ch WHERE done) AS topics_done,
+          (SELECT COUNT(*) FROM ch WHERE has_note) AS notes,
+          (SELECT COUNT(*) FROM se) AS tasks,
+          (SELECT COUNT(*) FROM se WHERE done) AS tasks_done,
+          (SELECT COUNT(*) FROM se WHERE NOT done AND due_date < ${TODAY}) AS tasks_overdue`),
       pool.query(`
-        SELECT
-          COUNT(*) FILTER (WHERE kind = 'feedback') AS feedback,
-          COUNT(*) FILTER (WHERE kind = 'bug') AS bugs,
-          COUNT(*) FILTER (WHERE created_at >= now() - interval '7 days') AS last_7d
+        SELECT COUNT(*) FILTER (WHERE kind = 'feedback') AS feedback,
+               COUNT(*) FILTER (WHERE kind = 'bug') AS bugs,
+               COUNT(*) FILTER (WHERE created_at >= now() - interval '7 days') AS last_7d
         FROM feedback`),
     ]);
-
-    const u = users.rows[0], d = devices.rows[0], st = study.rows[0], f = fb.rows[0];
-    const ev = Object.fromEntries(events.rows.map((r) => [r.event_type, Number(r.n)]));
-    const n = (v) => Number(v || 0);
-
+    const u = users.rows[0], d = devices.rows[0], s = study.rows[0], f = fb.rows[0];
     await logEvent(null, req.userId, "admin_panel_viewed", {});
-
     res.json({
       timezone: ADMIN_TZ,
       users: {
-        total: n(u.total), newToday: n(u.new_today), new7d: n(u.new_7d), new30d: n(u.new_30d),
-        active1d: n(u.active_1d), active7d: n(u.active_7d), active30d: n(u.active_30d),
+        total: num(u.total), newToday: num(u.new_today), new7d: num(u.new_7d), new30d: num(u.new_30d),
+        active1d: num(u.active_1d), active7d: num(u.active_7d), active30d: num(u.active_30d),
       },
-      devices: { ever: n(d.ever), active1d: n(d.d1), active7d: n(d.d7), active30d: n(d.d30) },
-      study: {
-        exams: n(st.exams), usersWithExams: n(st.users_with_exams),
-        topics: n(st.topics), topicsCompleted: n(st.topics_done), notes: n(st.notes),
-        sessions: n(st.sessions), sessionsCompleted: n(st.sessions_done),
+      devices: { ever: num(d.ever), active1d: num(d.d1), active7d: num(d.d7) },
+      exams: { total: num(s.exams), upcoming: num(s.upcoming), past: num(s.past), syllabusComplete: num(s.syllabus_complete) },
+      topics: { total: num(s.topics), completed: num(s.topics_done), withNotes: num(s.notes) },
+      tasks: {
+        total: num(s.tasks), completed: num(s.tasks_done), overdue: num(s.tasks_overdue),
+        pending: num(s.tasks) - num(s.tasks_done) - num(s.tasks_overdue),
       },
-      activity: {
-        focusSessions: ev.focus_session_completed || 0,
-        studyPlansCreated: ev.study_plan_created || 0,
-        syllabusUploads: ev.syllabus_uploaded || 0,
-        dateSheetUploads: ev.date_sheet_uploaded || 0,
-        failedUploads: ev.upload_failed || 0,
-      },
-      feedback: { feedback: n(f.feedback), bugs: n(f.bugs), last7d: n(f.last_7d) },
+      // Bug reports have no status yet, so every bug report counts as open until statuses are added.
+      feedback: { feedback: num(f.feedback), bugs: num(f.bugs), openBugs: num(f.bugs), last7d: num(f.last_7d), statusTracked: false },
     });
   } catch (e) {
-    console.error("admin overview error", e);
-    res.status(500).json({ error: "Couldn't load overview." });
+    adminError(res, "overview", e);
   }
 });
 
-// Daily series for charts: new sign-ups, active devices, active logged-in users, and each event type.
-app.get("/api/admin/activity", requireAdmin, async (req, res) => {
+/* ---- charts: time series for any range ---- */
+app.get("/api/admin/charts", requireAdmin, async (req, res) => {
   try {
-    const days = Math.min(90, Math.max(7, Number(req.query.days) || 30));
-    const series = await pool.query(
+    const range = ["7", "30", "90", "all"].includes(String(req.query.range)) ? String(req.query.range) : "30";
+    let start;
+    if (range === "all") {
+      const r = await pool.query(`
+        SELECT LEAST(
+          (SELECT MIN(created_at) FROM users), (SELECT MIN(created_at) FROM events), (SELECT MIN(created_at) FROM feedback)
+        ) AS first`);
+      start = r.rows[0].first ? new Date(r.rows[0].first) : new Date();
+    } else {
+      start = new Date(Date.now() - (Number(range) - 1) * 86400000);
+    }
+    const spanDays = Math.ceil((Date.now() - start.getTime()) / 86400000) + 1;
+    const requestedUnit = ["day", "week", "month"].includes(req.query.unit) ? req.query.unit : null;
+    const unit = requestedUnit || (spanDays > 120 ? "week" : "day");
+    const bucketTs = (col) => `date_trunc('${unit}', (${col} AT TIME ZONE '${ADMIN_TZ}'))::date`;
+    const bucketDate = (col) => `date_trunc('${unit}', ${col})::date`;
+
+    const result = await pool.query(
       `
-      WITH d AS (
+      WITH ${STUDY_CTE},
+      b AS (
         SELECT generate_series(
-          (date_trunc('day', now() AT TIME ZONE '${ADMIN_TZ}') - ($1::int - 1) * interval '1 day')::date,
-          (now() AT TIME ZONE '${ADMIN_TZ}')::date,
-          interval '1 day'
-        )::date AS day
+          date_trunc('${unit}', ($1::timestamptz AT TIME ZONE '${ADMIN_TZ}'))::date,
+          ${TODAY},
+          interval '1 ${unit}'
+        )::date AS bucket
       ),
-      signups AS (
-        SELECT (created_at AT TIME ZONE '${ADMIN_TZ}')::date AS day, COUNT(*) AS n FROM users GROUP BY 1
-      ),
+      signups AS (SELECT ${bucketTs("created_at")} AS bucket, COUNT(*) AS n FROM users GROUP BY 1),
       act AS (
-        SELECT (created_at AT TIME ZONE '${ADMIN_TZ}')::date AS day,
-               COUNT(DISTINCT device_id) AS devices,
-               COUNT(DISTINCT user_id) AS users
-        FROM events WHERE event_type <> 'admin_panel_viewed' GROUP BY 1
+        SELECT ${bucketTs("created_at")} AS bucket, COUNT(DISTINCT device_id) AS devices, COUNT(DISTINCT user_id) AS users
+        FROM events WHERE event_type NOT IN ('admin_panel_viewed') GROUP BY 1
+      ),
+      exams_created AS (SELECT ${bucketTs("created_at")} AS bucket, COUNT(*) AS n FROM events WHERE event_type = 'exam_created' GROUP BY 1),
+      tasks AS (
+        SELECT ${bucketDate("due_date")} AS bucket, COUNT(*) AS planned, COUNT(*) FILTER (WHERE done) AS completed
+        FROM se WHERE due_date IS NOT NULL GROUP BY 1
+      ),
+      fb AS (
+        SELECT ${bucketTs("created_at")} AS bucket,
+               COUNT(*) FILTER (WHERE kind = 'feedback') AS feedback, COUNT(*) FILTER (WHERE kind = 'bug') AS bugs
+        FROM feedback GROUP BY 1
       )
-      SELECT d.day::text AS day, COALESCE(signups.n, 0) AS signups, COALESCE(act.devices, 0) AS devices, COALESCE(act.users, 0) AS users
-      FROM d LEFT JOIN signups USING (day) LEFT JOIN act USING (day) ORDER BY d.day`,
-      [days]
-    );
-    const byType = await pool.query(
-      `SELECT event_type, COUNT(*) AS n FROM events
-       WHERE created_at >= now() - ($1::int * interval '1 day') AND event_type <> 'admin_panel_viewed'
-       GROUP BY event_type ORDER BY n DESC`,
-      [days]
+      SELECT b.bucket::text AS bucket,
+             COALESCE(signups.n, 0) AS signups,
+             COALESCE(act.devices, 0) AS active_devices,
+             COALESCE(act.users, 0) AS active_users,
+             COALESCE(exams_created.n, 0) AS exams_created,
+             COALESCE(tasks.planned, 0) AS tasks_planned,
+             COALESCE(tasks.completed, 0) AS tasks_completed,
+             COALESCE(fb.feedback, 0) AS feedback,
+             COALESCE(fb.bugs, 0) AS bugs
+      FROM b
+      LEFT JOIN signups USING (bucket) LEFT JOIN act USING (bucket) LEFT JOIN exams_created USING (bucket)
+      LEFT JOIN tasks USING (bucket) LEFT JOIN fb USING (bucket)
+      ORDER BY b.bucket`,
+      [start.toISOString()]
     );
     res.json({
-      timezone: ADMIN_TZ,
-      days: series.rows.map((r) => ({
-        date: String(r.day).slice(0, 10),
-        signups: Number(r.signups), activeDevices: Number(r.devices), activeUsers: Number(r.users),
+      range, unit, timezone: ADMIN_TZ,
+      points: result.rows.map((r) => ({
+        date: String(r.bucket).slice(0, 10),
+        signups: num(r.signups), activeDevices: num(r.active_devices), activeUsers: num(r.active_users),
+        examsCreated: num(r.exams_created), tasksPlanned: num(r.tasks_planned), tasksCompleted: num(r.tasks_completed),
+        feedback: num(r.feedback), bugs: num(r.bugs),
       })),
-      featureUsage: byType.rows.map((r) => ({ eventType: r.event_type, count: Number(r.n) })),
     });
   } catch (e) {
-    console.error("admin activity error", e);
-    res.status(500).json({ error: "Couldn't load activity." });
+    adminError(res, "charts", e);
   }
 });
 
-// Account-level list. Never returns password hashes or study content — only counts.
+/* ---- live activity feed (real events only) ---- */
+const FEED_EVENTS = ["exam_created", "study_plan_created", "focus_session_completed", "syllabus_uploaded", "date_sheet_uploaded", "user_login"];
+
+async function activityFeed({ userId = null, limit = 30 }) {
+  const params = [limit, FEED_EVENTS];
+  let userFilterUsers = "", userFilterEvents = "", userFilterFb = "";
+  if (userId) {
+    params.push(userId);
+    userFilterUsers = "WHERE u.id = $3";
+    userFilterEvents = "AND ev.user_id = $3";
+    userFilterFb = "WHERE f.user_id = $3";
+  }
+  const r = await pool.query(
+    `
+    SELECT * FROM (
+      SELECT 'student_registered' AS type, u.created_at AS at, u.id AS user_id, '{}'::jsonb AS meta FROM users u ${userFilterUsers}
+      UNION ALL
+      SELECT ev.event_type AS type, ev.created_at AS at, ev.user_id, ev.metadata AS meta
+      FROM events ev WHERE ev.event_type = ANY($2::text[]) ${userFilterEvents}
+      UNION ALL
+      SELECT CASE WHEN f.kind = 'bug' THEN 'bug_reported' ELSE 'feedback_submitted' END AS type, f.created_at AS at, f.user_id,
+             jsonb_build_object('page', f.page) AS meta
+      FROM feedback f ${userFilterFb}
+    ) a
+    LEFT JOIN (SELECT id, name FROM users) nm ON nm.id = a.user_id
+    ORDER BY a.at DESC
+    LIMIT $1`,
+    params
+  );
+  const SAFE_META = ["priority", "studiedMinutes", "subjects", "page"];
+  return r.rows.map((row) => {
+    const meta = {};
+    for (const k of SAFE_META) if (row.meta && row.meta[k] !== undefined) meta[k] = row.meta[k];
+    return { type: row.type, at: row.at, userId: row.user_id, userName: row.name || null, meta };
+  });
+}
+
+app.get("/api/admin/feed", requireAdmin, async (req, res) => {
+  try {
+    res.json({ items: await activityFeed({ limit: clampInt(req.query.limit, 30, 1, 100) }) });
+  } catch (e) {
+    adminError(res, "recent activity", e);
+  }
+});
+
+/* ---- students ---- */
 app.get("/api/admin/users", requireAdmin, async (req, res) => {
   try {
-    const limit = Math.min(100, Math.max(1, Number(req.query.limit) || 25));
-    const page = Math.max(1, Number(req.query.page) || 1);
-    const q = typeof req.query.q === "string" ? req.query.q.trim().slice(0, 100) : "";
-    const params = [limit, (page - 1) * limit];
-    let where = "";
-    if (q) { params.push(`%${q}%`); where = `WHERE u.name ILIKE $3 OR u.email ILIKE $3`; }
+    const limit = clampInt(req.query.limit, 25, 1, 100);
+    const page = clampInt(req.query.page, 1, 1, 100000);
+    const q = cleanText(req.query.q);
+    const status = ["active", "inactive"].includes(req.query.status) ? req.query.status : "all";
+    const sort = { newest: "u.created_at DESC", oldest: "u.created_at ASC", last_active: "seen.last_seen DESC NULLS LAST" }[req.query.sort] || "u.created_at DESC";
+    const joinedFrom = isoDate(req.query.joinedFrom);
+    const joinedTo = isoDate(req.query.joinedTo);
 
-    const [rows, total] = await Promise.all([
-      pool.query(
-        `
-        WITH ${STUDY_DATA_CTE},
-        exs AS (SELECT user_id, COUNT(*) AS n FROM ex GROUP BY user_id),
-        chs AS (SELECT user_id, COUNT(*) AS n, COUNT(*) FILTER (WHERE ${TOPIC_DONE}) AS done FROM ch GROUP BY user_id),
-        ses AS (SELECT user_id, COUNT(*) AS n, COUNT(*) FILTER (WHERE ${SESSION_DONE}) AS done FROM se GROUP BY user_id)
-        SELECT u.id, u.name, u.email, u.created_at, u.last_active_at, u.is_admin,
-               COALESCE(exs.n, 0) AS exams, COALESCE(chs.n, 0) AS topics, COALESCE(chs.done, 0) AS topics_done,
-               COALESCE(ses.n, 0) AS sessions, COALESCE(ses.done, 0) AS sessions_done,
-               ud.updated_at AS data_updated_at
-        FROM users u
-        LEFT JOIN exs ON exs.user_id = u.id
-        LEFT JOIN chs ON chs.user_id = u.id
-        LEFT JOIN ses ON ses.user_id = u.id
-        LEFT JOIN user_data ud ON ud.user_id = u.id
-        ${where}
-        ORDER BY u.created_at DESC
-        LIMIT $1 OFFSET $2`,
-        params
-      ),
-      pool.query(`SELECT COUNT(*) AS n FROM users u ${q ? "WHERE u.name ILIKE $1 OR u.email ILIKE $1" : ""}`, q ? [`%${q}%`] : []),
-    ]);
+    const where = [];
+    const params = [];
+    const add = (v) => { params.push(v); return `$${params.length}`; };
+    if (q) { const p = add(`%${q}%`); where.push(`(u.name ILIKE ${p} OR u.email ILIKE ${p})`); }
+    if (status === "active") where.push(`seen.last_seen >= now() - interval '30 days'`);
+    if (status === "inactive") where.push(`(seen.last_seen IS NULL OR seen.last_seen < now() - interval '30 days')`);
+    if (joinedFrom) where.push(`(u.created_at AT TIME ZONE '${ADMIN_TZ}')::date >= ${add(joinedFrom)}::date`);
+    if (joinedTo) where.push(`(u.created_at AT TIME ZONE '${ADMIN_TZ}')::date <= ${add(joinedTo)}::date`);
+    const whereSql = where.length ? "WHERE " + where.join(" AND ") : "";
+    const limitP = add(limit), offsetP = add((page - 1) * limit);
+
+    const rows = await pool.query(
+      `
+      WITH ${STUDY_CTE}, ${SEEN_CTE},
+      exs AS (SELECT user_id, COUNT(*) AS n, COUNT(*) FILTER (WHERE exam_date >= ${TODAY}) AS upcoming FROM ex GROUP BY user_id),
+      ses AS (SELECT user_id, COUNT(*) AS n, COUNT(*) FILTER (WHERE done) AS done FROM se GROUP BY user_id),
+      filtered AS (
+        SELECT u.id, u.name, u.email, u.created_at, u.is_admin, seen.last_seen
+        FROM users u JOIN seen ON seen.user_id = u.id
+        ${whereSql}
+      )
+      SELECT f.*, COALESCE(exs.n, 0) AS exams, COALESCE(exs.upcoming, 0) AS upcoming,
+             COALESCE(ses.n, 0) AS tasks, COALESCE(ses.done, 0) AS tasks_done,
+             (SELECT COUNT(*) FROM filtered) AS total_count
+      FROM filtered f
+      LEFT JOIN exs ON exs.user_id = f.id
+      LEFT JOIN ses ON ses.user_id = f.id
+      ORDER BY ${sort.replace("u.", "f.").replace("seen.", "f.")}
+      LIMIT ${limitP} OFFSET ${offsetP}`,
+      params
+    );
+    let total = rows.rows.length ? num(rows.rows[0].total_count) : 0;
+    if (!rows.rows.length && page > 1) {
+      const c = await pool.query(`WITH ${SEEN_CTE} SELECT COUNT(*) AS n FROM users u JOIN seen ON seen.user_id = u.id ${whereSql}`, params.slice(0, params.length - 2));
+      total = num(c.rows[0].n);
+    }
     res.json({
-      page, limit, total: Number(total.rows[0].n),
+      page, limit, total,
       users: rows.rows.map((r) => ({
-        id: r.id, name: r.name, email: r.email, isAdmin: r.is_admin === true,
-        createdAt: r.created_at, lastActiveAt: r.last_active_at, dataUpdatedAt: r.data_updated_at,
-        exams: Number(r.exams), topics: Number(r.topics), topicsCompleted: Number(r.topics_done),
-        sessions: Number(r.sessions), sessionsCompleted: Number(r.sessions_done),
+        id: r.id, name: r.name, email: r.email, isAdmin: r.is_admin === true, accountStatus: "active",
+        createdAt: r.created_at, lastActiveAt: r.last_seen,
+        exams: num(r.exams), upcomingExams: num(r.upcoming), tasks: num(r.tasks), tasksCompleted: num(r.tasks_done),
       })),
     });
   } catch (e) {
-    console.error("admin users error", e);
-    res.status(500).json({ error: "Couldn't load users." });
+    adminError(res, "student data", e);
   }
 });
 
+app.get("/api/admin/users/:id", requireAdmin, async (req, res) => {
+  try {
+    const id = Number.parseInt(req.params.id, 10);
+    if (!id) return res.status(400).json({ error: "Invalid student id." });
+    const u = await pool.query(
+      `WITH ${SEEN_CTE} SELECT u.id, u.name, u.email, u.created_at, u.is_admin, seen.last_seen FROM users u JOIN seen ON seen.user_id = u.id WHERE u.id = $1`,
+      [id]
+    );
+    if (!u.rows[0]) return res.status(404).json({ error: "Student not found." });
+    const [exams, tasks, feed] = await Promise.all([
+      pool.query(
+        `
+        WITH ${STUDY_CTE},
+        t AS (SELECT exam_id, COUNT(*) AS n, COUNT(*) FILTER (WHERE done) AS d FROM ch WHERE user_id = $1 GROUP BY exam_id)
+        SELECT ex.exam_id, ex.subject, ex.exam_date::text AS exam_date, ex.priority, ${EXAM_STATUS} AS status,
+               COALESCE(t.n, 0) AS topics, COALESCE(t.d, 0) AS topics_done
+        FROM ex LEFT JOIN t ON t.exam_id = ex.exam_id
+        WHERE ex.user_id = $1
+        ORDER BY ex.exam_date NULLS LAST`,
+        [id]
+      ),
+      pool.query(
+        `
+        WITH ${STUDY_CTE}
+        SELECT COUNT(*) AS total, COUNT(*) FILTER (WHERE done) AS done,
+               COUNT(*) FILTER (WHERE NOT done AND due_date < ${TODAY}) AS overdue
+        FROM se WHERE user_id = $1`,
+        [id]
+      ),
+      activityFeed({ userId: id, limit: 15 }),
+    ]);
+    const r = u.rows[0], t = tasks.rows[0];
+    const examRows = exams.rows.map((e) => ({
+      id: e.exam_id, subject: e.subject, examDate: e.exam_date, priority: e.priority, status: e.status,
+      topics: num(e.topics), topicsCompleted: num(e.topics_done),
+    }));
+    res.json({
+      student: {
+        id: r.id, name: r.name, email: r.email, isAdmin: r.is_admin === true, accountStatus: "active",
+        createdAt: r.created_at, lastActiveAt: r.last_seen,
+      },
+      exams: examRows,
+      examSummary: {
+        total: examRows.length,
+        upcoming: examRows.filter((e) => e.status === "upcoming").length,
+        past: examRows.filter((e) => e.status === "past").length,
+        syllabusComplete: examRows.filter((e) => e.topics > 0 && e.topics === e.topicsCompleted).length,
+      },
+      tasks: { total: num(t.total), completed: num(t.done), overdue: num(t.overdue), pending: num(t.total) - num(t.done) - num(t.overdue) },
+      subjects: [...new Set(examRows.map((e) => e.subject).filter(Boolean))],
+      activity: feed,
+    });
+  } catch (e) {
+    adminError(res, "this student", e);
+  }
+});
+
+/* ---- exams ---- */
+app.get("/api/admin/exams", requireAdmin, async (req, res) => {
+  try {
+    const limit = clampInt(req.query.limit, 25, 1, 100);
+    const page = clampInt(req.query.page, 1, 1, 100000);
+    const status = ["upcoming", "past", "syllabus_complete", "no_date"].includes(req.query.status) ? req.query.status : "all";
+    const subject = cleanText(req.query.subject);
+    const q = cleanText(req.query.q);
+    const from = isoDate(req.query.from), to = isoDate(req.query.to);
+
+    const where = [];
+    const params = [];
+    const add = (v) => { params.push(v); return `$${params.length}`; };
+    if (status === "upcoming") where.push(`x.exam_date >= ${TODAY}`);
+    if (status === "past") where.push(`x.exam_date < ${TODAY}`);
+    if (status === "no_date") where.push(`x.exam_date IS NULL`);
+    if (status === "syllabus_complete") where.push(`x.topics > 0 AND x.topics = x.topics_done`);
+    if (subject) where.push(`lower(x.subject) = lower(${add(subject)})`);
+    if (q) { const p = add(`%${q}%`); where.push(`(x.subject ILIKE ${p} OR x.student_name ILIKE ${p} OR x.student_email ILIKE ${p})`); }
+    if (from) where.push(`x.exam_date >= ${add(from)}::date`);
+    if (to) where.push(`x.exam_date <= ${add(to)}::date`);
+    const whereSql = where.length ? "WHERE " + where.join(" AND ") : "";
+    const limitP = add(limit), offsetP = add((page - 1) * limit);
+
+    const base = `
+      WITH ${STUDY_CTE},
+      t AS (SELECT user_id, exam_id, COUNT(*) AS n, COUNT(*) FILTER (WHERE done) AS d FROM ch GROUP BY user_id, exam_id),
+      x AS (
+        SELECT ex.user_id, ex.exam_id, ex.subject, ex.exam_date, ex.priority, ${EXAM_STATUS} AS status,
+               COALESCE(t.n, 0) AS topics, COALESCE(t.d, 0) AS topics_done,
+               u.name AS student_name, u.email AS student_email
+        FROM ex JOIN users u ON u.id = ex.user_id
+        LEFT JOIN t ON t.user_id = ex.user_id AND t.exam_id = ex.exam_id
+      )`;
+    const [rows, stats, subjects] = await Promise.all([
+      pool.query(
+        `${base}, filtered AS (SELECT * FROM x ${whereSql})
+         SELECT *, exam_date::text AS exam_date_text, (SELECT COUNT(*) FROM filtered) AS total_count
+         FROM filtered ORDER BY (exam_date < ${TODAY}), exam_date NULLS LAST, subject
+         LIMIT ${limitP} OFFSET ${offsetP}`,
+        params
+      ),
+      pool.query(`${base}
+        SELECT COUNT(*) AS total,
+               COUNT(*) FILTER (WHERE exam_date >= ${TODAY}) AS upcoming,
+               COUNT(*) FILTER (WHERE exam_date < ${TODAY}) AS past,
+               COUNT(*) FILTER (WHERE exam_date >= date_trunc('week', ${TODAY})::date AND exam_date < date_trunc('week', ${TODAY})::date + 7) AS this_week,
+               COUNT(*) FILTER (WHERE topics > 0 AND topics = topics_done) AS syllabus_complete
+        FROM x`),
+      pool.query(`WITH ${STUDY_CTE}
+        SELECT MIN(subject) AS subject, COUNT(*) AS n FROM ex WHERE subject IS NOT NULL
+        GROUP BY lower(subject) ORDER BY n DESC, MIN(subject) LIMIT 100`),
+    ]);
+    const s = stats.rows[0];
+    res.json({
+      page, limit, total: rows.rows.length ? num(rows.rows[0].total_count) : 0,
+      stats: { total: num(s.total), upcoming: num(s.upcoming), past: num(s.past), thisWeek: num(s.this_week), syllabusComplete: num(s.syllabus_complete) },
+      subjects: subjects.rows.map((r) => r.subject),
+      exams: rows.rows.map((r) => ({
+        userId: r.user_id, examId: r.exam_id, subject: r.subject, examDate: r.exam_date_text, priority: r.priority, status: r.status,
+        topics: num(r.topics), topicsCompleted: num(r.topics_done),
+        studentName: r.student_name, studentEmail: r.student_email,
+      })),
+    });
+  } catch (e) {
+    adminError(res, "exams", e);
+  }
+});
+
+app.get("/api/admin/exams/:userId/:examId", requireAdmin, async (req, res) => {
+  try {
+    const userId = Number.parseInt(req.params.userId, 10);
+    const examId = cleanText(req.params.examId, 200);
+    if (!userId || !examId) return res.status(400).json({ error: "Invalid exam." });
+    const exam = await pool.query(
+      `WITH ${STUDY_CTE}
+       SELECT ex.exam_id, ex.subject, ex.exam_date::text AS exam_date, ex.priority, ${EXAM_STATUS} AS status, u.id AS uid, u.name, u.email
+       FROM ex JOIN users u ON u.id = ex.user_id WHERE ex.user_id = $1 AND ex.exam_id = $2 LIMIT 1`,
+      [userId, examId]
+    );
+    if (!exam.rows[0]) return res.status(404).json({ error: "Exam not found." });
+    const [topics, sessions] = await Promise.all([
+      pool.query(
+        `WITH ${STUDY_CTE} SELECT name, difficulty, done, has_note, est_minutes FROM ch WHERE user_id = $1 AND exam_id = $2`,
+        [userId, examId]
+      ),
+      pool.query(
+        `WITH ${STUDY_CTE}
+         SELECT se.chapter_name, se.due_date::text AS due_date, se.start_time, se.end_time, ${TASK_STATUS} AS status
+         FROM se WHERE se.user_id = $1 AND se.exam_id = $2 ORDER BY se.due_date NULLS LAST, se.start_time`,
+        [userId, examId]
+      ),
+    ]);
+    const e = exam.rows[0];
+    res.json({
+      exam: { id: e.exam_id, subject: e.subject, examDate: e.exam_date, priority: e.priority, status: e.status, createdAt: null },
+      student: { id: e.uid, name: e.name, email: e.email },
+      // Topic names and difficulty are syllabus structure; the text of students' personal notes is not shown.
+      topics: topics.rows.map((t) => ({ name: t.name, difficulty: t.difficulty, completed: t.done, hasNotes: t.has_note, estMinutes: t.est_minutes })),
+      sessions: sessions.rows.map((s) => ({ chapter: s.chapter_name, date: s.due_date, start: s.start_time, end: s.end_time, status: s.status })),
+    });
+  } catch (e) {
+    adminError(res, "this exam", e);
+  }
+});
+
+/* ---- study tasks (planner sessions) ---- */
+app.get("/api/admin/tasks", requireAdmin, async (req, res) => {
+  try {
+    const limit = clampInt(req.query.limit, 25, 1, 100);
+    const page = clampInt(req.query.page, 1, 1, 100000);
+    const status = ["completed", "pending", "overdue"].includes(req.query.status) ? req.query.status : "all";
+    const subject = cleanText(req.query.subject);
+    const difficulty = cleanText(req.query.difficulty, 30);
+    const q = cleanText(req.query.q);
+    const from = isoDate(req.query.from), to = isoDate(req.query.to);
+    const sort = req.query.sort === "due_desc" ? "t.due_date DESC NULLS LAST" : "t.due_date ASC NULLS LAST";
+
+    const where = [];
+    const params = [];
+    const add = (v) => { params.push(v); return `$${params.length}`; };
+    if (status !== "all") where.push(`t.status = ${add(status)}`);
+    if (subject) where.push(`lower(t.subject) = lower(${add(subject)})`);
+    if (difficulty) where.push(`lower(t.difficulty) = lower(${add(difficulty)})`);
+    if (q) { const p = add(`%${q}%`); where.push(`(t.chapter ILIKE ${p} OR t.subject ILIKE ${p} OR t.student_name ILIKE ${p} OR t.student_email ILIKE ${p})`); }
+    if (from) where.push(`t.due_date >= ${add(from)}::date`);
+    if (to) where.push(`t.due_date <= ${add(to)}::date`);
+    const whereSql = where.length ? "WHERE " + where.join(" AND ") : "";
+    const limitP = add(limit), offsetP = add((page - 1) * limit);
+
+    const base = `
+      WITH ${STUDY_CTE},
+      t AS (
+        SELECT se.user_id, se.session_id, COALESCE(se.subject, ex.subject) AS subject,
+               COALESCE(se.chapter_name, ch.name) AS chapter, ch.difficulty,
+               se.due_date, se.start_time, se.end_time, ${TASK_STATUS} AS status,
+               u.name AS student_name, u.email AS student_email
+        FROM se
+        JOIN users u ON u.id = se.user_id
+        LEFT JOIN LATERAL (SELECT subject FROM ex WHERE ex.user_id = se.user_id AND ex.exam_id = se.exam_id LIMIT 1) ex ON true
+        LEFT JOIN LATERAL (
+          SELECT name, difficulty FROM ch
+          WHERE ch.user_id = se.user_id AND ch.chapter_id = se.chapter_id AND (se.exam_id IS NULL OR ch.exam_id = se.exam_id)
+          LIMIT 1
+        ) ch ON true
+      )`;
+    const [rows, stats, facets] = await Promise.all([
+      pool.query(
+        `${base}, filtered AS (SELECT t.* FROM t ${whereSql})
+         SELECT t.*, t.due_date::text AS due_text, (SELECT COUNT(*) FROM filtered) AS total_count
+         FROM filtered t ORDER BY ${sort}, t.start_time NULLS LAST LIMIT ${limitP} OFFSET ${offsetP}`,
+        params
+      ),
+      pool.query(`${base}
+        SELECT COUNT(*) AS total, COUNT(*) FILTER (WHERE status = 'completed') AS completed,
+               COUNT(*) FILTER (WHERE status = 'pending') AS pending, COUNT(*) FILTER (WHERE status = 'overdue') AS overdue
+        FROM t`),
+      pool.query(`${base}
+        SELECT (SELECT jsonb_agg(DISTINCT subject) FROM t WHERE subject IS NOT NULL) AS subjects,
+               (SELECT jsonb_agg(DISTINCT difficulty) FROM t WHERE difficulty IS NOT NULL) AS difficulties`),
+    ]);
+    const s = stats.rows[0];
+    res.json({
+      page, limit, total: rows.rows.length ? num(rows.rows[0].total_count) : 0,
+      stats: {
+        total: num(s.total), completed: num(s.completed), pending: num(s.pending), overdue: num(s.overdue),
+        completionRate: num(s.total) ? Math.round((num(s.completed) / num(s.total)) * 100) : null,
+      },
+      subjects: facets.rows[0].subjects || [],
+      difficulties: facets.rows[0].difficulties || [],
+      tasks: rows.rows.map((r) => ({
+        userId: r.user_id, studentName: r.student_name, studentEmail: r.student_email,
+        task: r.chapter ? `Study ${r.chapter}` : "Study session",
+        subject: r.subject, chapter: r.chapter, difficulty: r.difficulty,
+        dueDate: r.due_text, start: r.start_time, end: r.end_time, status: r.status, createdAt: null,
+      })),
+    });
+  } catch (e) {
+    adminError(res, "study tasks", e);
+  }
+});
+
+/* ---- analytics ---- */
+app.get("/api/admin/analytics", requireAdmin, async (req, res) => {
+  try {
+    const range = ["7", "30", "90", "all"].includes(String(req.query.range)) ? String(req.query.range) : "30";
+    const since = range === "all" ? `'-infinity'::timestamptz` : `now() - interval '${Number(range)} days'`;
+    const [users, examStats, subjects, study, difficulty] = await Promise.all([
+      pool.query(`
+        WITH ${SEEN_CTE},
+        dev_days AS (
+          SELECT device_id, COUNT(DISTINCT (created_at AT TIME ZONE '${ADMIN_TZ}')::date) AS days
+          FROM events WHERE device_id IS NOT NULL AND created_at >= ${since} AND event_type <> 'admin_panel_viewed'
+          GROUP BY device_id
+        )
+        SELECT (SELECT COUNT(*) FROM users) AS total,
+               (SELECT COUNT(*) FROM users WHERE created_at >= ${since}) AS new_users,
+               (SELECT COUNT(*) FROM seen WHERE last_seen >= ${since}) AS active,
+               (SELECT COUNT(*) FROM dev_days) AS devices,
+               (SELECT COUNT(*) FROM dev_days WHERE days >= 2) AS returning_devices`),
+      pool.query(`
+        WITH ${STUDY_CTE},
+        t AS (SELECT user_id, exam_id, COUNT(*) AS n, COUNT(*) FILTER (WHERE done) AS d FROM ch GROUP BY user_id, exam_id)
+        SELECT (SELECT COUNT(*) FROM events WHERE event_type = 'exam_created' AND created_at >= ${since}) AS created,
+               (SELECT COUNT(*) FROM ex) AS total,
+               (SELECT COUNT(*) FROM ex WHERE exam_date >= ${TODAY}) AS upcoming,
+               (SELECT COUNT(*) FROM ex WHERE exam_date < ${TODAY}) AS past,
+               (SELECT COUNT(*) FROM t WHERE n > 0 AND n = d) AS syllabus_complete`),
+      pool.query(`
+        WITH ${STUDY_CTE}
+        SELECT MIN(subject) AS subject, COUNT(*) AS n FROM ex WHERE subject IS NOT NULL
+        GROUP BY lower(subject) ORDER BY n DESC, MIN(subject) LIMIT 10`),
+      pool.query(`
+        WITH ${STUDY_CTE}
+        SELECT (SELECT COUNT(*) FROM se) AS tasks, (SELECT COUNT(*) FROM se WHERE done) AS tasks_done,
+               (SELECT COUNT(*) FROM se WHERE NOT done AND due_date < ${TODAY}) AS overdue,
+               (SELECT COUNT(*) FROM events WHERE event_type = 'study_plan_created' AND created_at >= ${since}) AS plans,
+               (SELECT COUNT(*) FROM events WHERE event_type = 'focus_session_completed' AND created_at >= ${since}) AS focus`),
+      pool.query(`
+        WITH ${STUDY_CTE}
+        SELECT COALESCE(difficulty, 'Not set') AS difficulty, COUNT(*) AS topics, COUNT(*) FILTER (WHERE done) AS completed
+        FROM ch GROUP BY 1 ORDER BY 2 DESC`),
+    ]);
+    const u = users.rows[0], x = examStats.rows[0], s = study.rows[0];
+    res.json({
+      range,
+      users: {
+        total: num(u.total), newUsers: num(u.new_users), active: num(u.active),
+        devices: num(u.devices), returningDevices: num(u.returning_devices),
+      },
+      exams: {
+        createdInRange: num(x.created), total: num(x.total), upcoming: num(x.upcoming), past: num(x.past),
+        syllabusComplete: num(x.syllabus_complete),
+        topSubjects: subjects.rows.map((r) => ({ subject: r.subject, count: num(r.n) })),
+      },
+      study: {
+        tasks: num(s.tasks), completed: num(s.tasks_done), overdue: num(s.overdue),
+        completionRate: num(s.tasks) ? Math.round((num(s.tasks_done) / num(s.tasks)) * 100) : null,
+        studyPlansInRange: num(s.plans), focusSessionsInRange: num(s.focus),
+        difficulty: difficulty.rows.map((r) => ({ difficulty: r.difficulty, topics: num(r.topics), completed: num(r.completed) })),
+      },
+    });
+  } catch (e) {
+    adminError(res, "analytics", e);
+  }
+});
+
+/* ---- feedback & bug reports (read-only for now) ---- */
 app.get("/api/admin/feedback", requireAdmin, async (req, res) => {
   try {
-    const limit = Math.min(200, Math.max(1, Number(req.query.limit) || 50));
+    const limit = clampInt(req.query.limit, 50, 1, 200);
     const kind = req.query.kind === "bug" || req.query.kind === "feedback" ? req.query.kind : null;
+    const q = cleanText(req.query.q, 200);
+    const where = [];
+    const params = [limit];
+    if (kind) { params.push(kind); where.push(`f.kind = $${params.length}`); }
+    if (q) { params.push(`%${q}%`); where.push(`(f.message ILIKE $${params.length} OR u.name ILIKE $${params.length} OR u.email ILIKE $${params.length})`); }
+    const order = req.query.sort === "oldest" ? "ASC" : "DESC";
     const result = await pool.query(
-      `SELECT f.id, f.kind, f.message, f.page, f.user_agent, f.created_at, u.name AS user_name, u.email AS user_email
+      `SELECT f.id, f.kind, f.message, f.page, f.user_agent, f.created_at, f.user_id, u.name AS user_name, u.email AS user_email
        FROM feedback f LEFT JOIN users u ON u.id = f.user_id
-       ${kind ? "WHERE f.kind = $2" : ""}
-       ORDER BY f.created_at DESC LIMIT $1`,
-      kind ? [limit, kind] : [limit]
+       ${where.length ? "WHERE " + where.join(" AND ") : ""}
+       ORDER BY f.created_at ${order} LIMIT $1`,
+      params
     );
     res.json({ items: result.rows });
   } catch (e) {
-    console.error("admin feedback error", e);
-    res.status(500).json({ error: "Couldn't load feedback." });
+    adminError(res, "feedback", e);
   }
 });
 
@@ -698,40 +1154,94 @@ app.get("/api/admin/events", requireAdmin, async (req, res) => {
       : await pool.query("SELECT id, device_id, user_id, event_type, metadata, created_at FROM events ORDER BY created_at DESC LIMIT $1", [limit]);
     res.json({ events: result.rows });
   } catch (e) {
-    console.error("admin events error", e);
-    res.status(500).json({ error: "Couldn't load events." });
+    adminError(res, "events", e);
   }
 });
 
+/* ---- system health ---- */
 app.get("/api/admin/health", requireAdmin, async (req, res) => {
-  const startedAt = Date.now();
-  let dbOk = true;
+  const checkedAt = new Date().toISOString();
+  const services = {};
+
+  services.api = { status: "online", responseMs: 0, detail: `Running for ${Math.round(process.uptime())} s` };
+
+  let t = Date.now();
   try {
     await pool.query("SELECT 1");
+    services.database = { status: "online", responseMs: Date.now() - t };
   } catch (e) {
-    dbOk = false;
+    services.database = { status: "offline", responseMs: null, detail: "The database can't be reached." };
   }
-  const dbLatencyMs = Date.now() - startedAt;
-  let errorCountToday = 0, lastError = null, dbSizeBytes = null;
-  try {
-    const r = await pool.query(`SELECT COUNT(*) AS n, MAX(created_at) AS last FROM events WHERE event_type = 'api_error' AND created_at >= now() - interval '1 day'`);
-    errorCountToday = Number(r.rows[0].n);
-    lastError = r.rows[0].last;
-    const sz = await pool.query(`SELECT pg_database_size(current_database()) AS b`);
-    dbSizeBytes = Number(sz.rows[0].b);
-  } catch (e) { /* ignore */ }
 
+  t = Date.now();
+  try {
+    const probe = jwt.sign({ probe: true }, JWT_SECRET, { expiresIn: 30 });
+    jwt.verify(probe, JWT_SECRET);
+    let usersOk = services.database.status === "online";
+    if (usersOk) await pool.query("SELECT 1 FROM users LIMIT 1");
+    services.auth = { status: usersOk ? "online" : "offline", responseMs: Date.now() - t, detail: usersOk ? "Sign-in tokens and account lookup working" : "Accounts can't be checked while the database is offline" };
+  } catch (e) {
+    services.auth = { status: "offline", responseMs: null, detail: "Sign-in tokens can't be created or checked." };
+  }
+
+  t = Date.now();
+  try {
+    const r = await fetch(FRONTEND_URL, { method: "GET", signal: AbortSignal.timeout(8000) });
+    services.frontend = { status: r.ok ? "online" : "offline", responseMs: Date.now() - t, detail: r.ok ? "Student website responding" : `Website returned status ${r.status}` };
+  } catch (e) {
+    services.frontend = { status: "offline", responseMs: null, detail: "The student website didn't respond within 8 seconds." };
+  }
+
+  let errors = [], errorCount24h = 0, dbSizeBytes = null;
+  if (services.database.status === "online") {
+    try {
+      const [er, cnt, sz] = await Promise.all([
+        pool.query(`SELECT created_at, metadata FROM events WHERE event_type = 'api_error' ORDER BY created_at DESC LIMIT 15`),
+        pool.query(`SELECT COUNT(*) AS n FROM events WHERE event_type = 'api_error' AND created_at >= now() - interval '1 day'`),
+        pool.query(`SELECT pg_database_size(current_database()) AS b`),
+      ]);
+      errors = er.rows.map((r) => ({
+        at: r.created_at,
+        route: typeof r.metadata?.route === "string" ? r.metadata.route.slice(0, 100) : null,
+        message: typeof r.metadata?.message === "string" ? r.metadata.message.slice(0, 200) : null,
+      }));
+      errorCount24h = num(cnt.rows[0].n);
+      dbSizeBytes = num(sz.rows[0].b);
+    } catch (e) { /* ignore */ }
+  }
+
+  const anyOffline = Object.values(services).some((s) => s.status !== "online");
   res.json({
-    status: dbOk ? (errorCountToday > 20 ? "warning" : "healthy") : "critical",
-    database: dbOk ? "connected" : "unreachable",
-    databaseLatencyMs: dbLatencyMs,
+    checkedAt,
+    status: services.database.status !== "online" || services.auth.status !== "online" ? "critical" : anyOffline || errorCount24h > 20 ? "warning" : "healthy",
+    services,
     databaseSizeBytes: dbSizeBytes,
-    processUptimeSeconds: Math.round(process.uptime()),
-    nodeVersion: process.version,
     smartImportConfigured: Boolean(GEMINI_API_KEY),
-    errorCountToday,
-    lastErrorAt: lastError,
+    errorCount24h,
+    recentErrors: errors,
   });
+});
+
+/* ---- current admin session ---- */
+app.get("/api/admin/me", requireAdmin, async (req, res) => {
+  try {
+    const [u, logins] = await Promise.all([
+      pool.query("SELECT name, email, created_at FROM users WHERE id = $1", [req.userId]),
+      pool.query("SELECT created_at FROM events WHERE user_id = $1 AND event_type = 'user_login' ORDER BY created_at DESC LIMIT 5", [req.userId]),
+    ]);
+    const p = req.tokenPayload || {};
+    res.json({
+      name: u.rows[0].name, email: u.rows[0].email, accountCreatedAt: u.rows[0].created_at,
+      recentLogins: logins.rows.map((r) => r.created_at),
+      session: {
+        signedInAt: p.iat ? new Date(p.iat * 1000).toISOString() : null,
+        expiresAt: p.exp ? new Date(p.exp * 1000).toISOString() : null,
+      },
+      timezone: ADMIN_TZ,
+    });
+  } catch (e) {
+    adminError(res, "admin session", e);
+  }
 });
 
 app.get("/health", (req, res) => res.json({ ok: true }));

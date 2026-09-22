@@ -12,6 +12,18 @@ const TABLES = [
 const BATCH = 500;
 
 async function copyTable(src, dst, t) {
+  // Only copy columns that actually exist in the old database (older tables may lack newer columns).
+  const existing = (await src.query(
+    "SELECT column_name FROM information_schema.columns WHERE table_schema = 'public' AND table_name = $1",
+    [t.name]
+  )).rows.map((r) => r.column_name);
+  if (!existing.length) {
+    console.log(`MIGRATION: ${t.name}: table not found in old database, skipping`);
+    return 0;
+  }
+  const missing = t.cols.filter((c) => !existing.includes(c));
+  if (missing.length) console.log(`MIGRATION: ${t.name}: old database has no ${missing.join(", ")} column(s), using defaults`);
+  t = { ...t, cols: t.cols.filter((c) => existing.includes(c)) };
   let lastKey = -1;
   let copied = 0;
   for (;;) {
@@ -59,7 +71,7 @@ module.exports = async function migrate() {
     // Verify counts match.
     let allMatch = true;
     for (const t of TABLES) {
-      const a = Number((await src.query(`SELECT COUNT(*) AS n FROM ${t.name}`)).rows[0].n);
+      const a = Number((await src.query(`SELECT COUNT(*) AS n FROM ${t.name}`).catch(() => ({ rows: [{ n: 0 }] }))).rows[0].n);
       const b = Number((await dst.query(`SELECT COUNT(*) AS n FROM ${t.name}`)).rows[0].n);
       if (a !== b) allMatch = false;
       console.log(`MIGRATION CHECK: ${t.name}: old=${a} new=${b} ${a === b ? "OK" : "MISMATCH"}`);

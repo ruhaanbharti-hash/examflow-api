@@ -10,7 +10,6 @@ const DATABASE_URL = process.env.DATABASE_URL;
 const JWT_SECRET = process.env.JWT_SECRET;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
-const ADMIN_KEY = process.env.ADMIN_KEY || "";
 const FRONTEND_ORIGINS = (process.env.FRONTEND_ORIGIN || "")
   .split(",")
   .map((s) => s.trim())
@@ -63,6 +62,34 @@ async function initDb() {
   `);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_events_type_time ON events(event_type, created_at);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_events_device ON events(device_id);`);
+  // Admin panel additions — all backwards-compatible (new columns with defaults / new tables only).
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS is_admin BOOLEAN NOT NULL DEFAULT false;`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_active_at TIMESTAMPTZ;`);
+  await pool.query(`ALTER TABLE events ADD COLUMN IF NOT EXISTS user_id INTEGER REFERENCES users(id) ON DELETE SET NULL;`);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS feedback (
+      id SERIAL PRIMARY KEY,
+      kind TEXT NOT NULL CHECK (kind IN ('feedback', 'bug')),
+      message TEXT NOT NULL,
+      page TEXT,
+      user_agent TEXT,
+      device_id TEXT,
+      user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_feedback_time ON feedback(created_at);`);
+}
+
+// Records that a logged-in user was active. Throttled to one write per user per 5 minutes.
+function touchActive(userId) {
+  if (!userId) return;
+  pool
+    .query(
+      "UPDATE users SET last_active_at = now() WHERE id = $1 AND (last_active_at IS NULL OR last_active_at < now() - interval '5 minutes')",
+      [userId]
+    )
+    .catch((e) => console.error("touchActive failed", e.message));
 }
 
 async function logEvent(deviceId, userId, eventType, metadata) {
@@ -102,6 +129,7 @@ function optionalAuth(req, res, next) {
     try {
       const payload = jwt.verify(token, JWT_SECRET);
       req.userId = payload.sub;
+      touchActive(req.userId);
     } catch (e) { /* invalid/expired — treat as anonymous */ }
   }
   next();
@@ -114,6 +142,7 @@ function requireAuth(req, res, next) {
   try {
     const payload = jwt.verify(token, JWT_SECRET);
     req.userId = payload.sub;
+    touchActive(req.userId);
     next();
   } catch (e) {
     return res.status(401).json({ error: "Your session has expired. Please log in again." });
@@ -121,6 +150,15 @@ function requireAuth(req, res, next) {
 }
 
 /* ---------------- auth routes ---------------- */
+
+// Slows down password guessing: 20 login attempts per IP per 15 minutes.
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many login attempts. Please wait a few minutes and try again." },
+});
 
 app.post("/api/auth/signup", async (req, res) => {
   try {
@@ -150,7 +188,7 @@ app.post("/api/auth/signup", async (req, res) => {
   }
 });
 
-app.post("/api/auth/login", async (req, res) => {
+app.post("/api/auth/login", loginLimiter, async (req, res) => {
   try {
     const { email, password } = req.body || {};
     if (!email || !password) return res.status(400).json({ error: "Please enter your email and password." });
@@ -174,10 +212,10 @@ app.post("/api/auth/login", async (req, res) => {
 
 app.get("/api/me", requireAuth, async (req, res) => {
   try {
-    const result = await pool.query("SELECT id, name, email, created_at FROM users WHERE id = $1", [req.userId]);
-    const user = result.rows[0];
-    if (!user) return res.status(404).json({ error: "Account not found." });
-    res.json({ user });
+    const result = await pool.query("SELECT id, name, email, created_at, is_admin FROM users WHERE id = $1", [req.userId]);
+    const row = result.rows[0];
+    if (!row) return res.status(404).json({ error: "Account not found." });
+    res.json({ user: { id: row.id, name: row.name, email: row.email, created_at: row.created_at, isAdmin: row.is_admin === true } });
   } catch (e) {
     console.error("me error", e);
     res.status(500).json({ error: "Couldn't load your account." });
@@ -234,6 +272,39 @@ app.post("/api/track", optionalAuth, async (req, res) => {
   if (!eventType || typeof eventType !== "string") return res.status(400).json({ error: "Missing event type." });
   await logEvent(deviceId, req.userId, eventType, metadata && typeof metadata === "object" ? metadata : {});
   res.json({ ok: true });
+});
+
+/* ---------------- feedback & bug reports (works with or without an account) ---------------- */
+
+const feedbackLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "You've sent a lot of messages recently. Please try again later." },
+});
+
+app.post("/api/feedback", feedbackLimiter, optionalAuth, async (req, res) => {
+  try {
+    const { kind, message, page, deviceId } = req.body || {};
+    if (kind !== "feedback" && kind !== "bug") return res.status(400).json({ error: "Choose feedback or bug report." });
+    if (!message || typeof message !== "string" || !message.trim()) return res.status(400).json({ error: "Please write a message." });
+    await pool.query(
+      "INSERT INTO feedback (kind, message, page, user_agent, device_id, user_id) VALUES ($1, $2, $3, $4, $5, $6)",
+      [
+        kind,
+        message.trim().slice(0, 4000),
+        typeof page === "string" ? page.slice(0, 300) : null,
+        String(req.headers["user-agent"] || "").slice(0, 300),
+        typeof deviceId === "string" ? deviceId.slice(0, 100) : null,
+        req.userId || null,
+      ]
+    );
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("feedback error", e);
+    res.status(500).json({ error: "Couldn't send your message. Please try again." });
+  }
 });
 
 /* ---------------- smart import (AI extraction via Gemini, multi-pass merge) ---------------- */
@@ -393,43 +464,228 @@ app.post("/api/import/analyze", importLimiter, optionalAuth, async (req, res) =>
   }
 });
 
-/* ---------------- admin (usage analytics) ---------------- */
+/* ---------------- admin (read-only analytics) ---------------- */
+// Access is decided by the server from the database (users.is_admin), never by anything the browser sends.
+// Only accounts marked is_admin = true in the database can use these routes.
 
 function requireAdmin(req, res, next) {
-  if (!ADMIN_KEY) return res.status(503).json({ error: "Admin dashboard isn't configured yet." });
-  const key = req.headers["x-admin-key"];
-  if (key !== ADMIN_KEY) return res.status(401).json({ error: "Invalid admin key." });
-  next();
+  requireAuth(req, res, async () => {
+    try {
+      const r = await pool.query("SELECT is_admin FROM users WHERE id = $1", [req.userId]);
+      if (!r.rows[0] || r.rows[0].is_admin !== true) {
+        return res.status(403).json({ error: "This account doesn't have access to the admin panel." });
+      }
+      res.set("Cache-Control", "no-store");
+      next();
+    } catch (e) {
+      console.error("requireAdmin error", e);
+      res.status(500).json({ error: "Couldn't verify admin access." });
+    }
+  });
 }
+
+// Timezone used for "today" and daily charts.
+const ADMIN_TZ = "Asia/Kolkata";
+
+// Expands each user's saved study data into exams, syllabus topics (chapters) and planned study sessions.
+const STUDY_DATA_CTE = `
+  ex AS (
+    SELECT ud.user_id, e FROM user_data ud,
+      jsonb_array_elements(CASE WHEN jsonb_typeof(ud.data->'exams') = 'array' THEN ud.data->'exams' ELSE '[]'::jsonb END) e
+  ),
+  ch AS (
+    SELECT ex.user_id, c FROM ex,
+      jsonb_array_elements(CASE WHEN jsonb_typeof(e->'chapters') = 'array' THEN e->'chapters' ELSE '[]'::jsonb END) c
+  ),
+  se AS (
+    SELECT ud.user_id, s FROM user_data ud,
+      jsonb_array_elements(CASE WHEN jsonb_typeof(ud.data->'sessions') = 'array' THEN ud.data->'sessions' ELSE '[]'::jsonb END) s
+  )`;
+const TOPIC_DONE = `(c->>'status' = 'completed' OR c->>'completed' = 'true')`;
+const TOPIC_HAS_NOTE = `(COALESCE(btrim(c->>'notes'), '') <> '')`;
+const SESSION_DONE = `(s->>'completed' = 'true')`;
 
 app.get("/api/admin/overview", requireAdmin, async (req, res) => {
   try {
-    const dayAgo = "now() - interval '1 day'";
-    const weekAgo = "now() - interval '7 days'";
-    const monthAgo = "now() - interval '30 days'";
-
-    const [usersTotal, usersToday, usersWeek, devicesTotal, eventsByType, activeToday, activeWeek] = await Promise.all([
-      pool.query(`SELECT COUNT(*) AS n FROM users`),
-      pool.query(`SELECT COUNT(*) AS n FROM users WHERE created_at >= ${dayAgo}`),
-      pool.query(`SELECT COUNT(*) AS n FROM users WHERE created_at >= ${weekAgo}`),
-      pool.query(`SELECT COUNT(DISTINCT device_id) AS n FROM events WHERE device_id IS NOT NULL`),
-      pool.query(`SELECT event_type, COUNT(*) AS n FROM events WHERE created_at >= ${monthAgo} GROUP BY event_type ORDER BY n DESC`),
-      pool.query(`SELECT COUNT(DISTINCT device_id) AS n FROM events WHERE device_id IS NOT NULL AND created_at >= ${dayAgo}`),
-      pool.query(`SELECT COUNT(DISTINCT device_id) AS n FROM events WHERE device_id IS NOT NULL AND created_at >= ${weekAgo}`),
+    const [users, devices, study, events, fb] = await Promise.all([
+      pool.query(`
+        SELECT
+          COUNT(*) AS total,
+          COUNT(*) FILTER (WHERE created_at >= date_trunc('day', now() AT TIME ZONE '${ADMIN_TZ}') AT TIME ZONE '${ADMIN_TZ}') AS new_today,
+          COUNT(*) FILTER (WHERE created_at >= now() - interval '7 days') AS new_7d,
+          COUNT(*) FILTER (WHERE created_at >= now() - interval '30 days') AS new_30d,
+          COUNT(*) FILTER (WHERE last_active_at >= now() - interval '1 day') AS active_1d,
+          COUNT(*) FILTER (WHERE last_active_at >= now() - interval '7 days') AS active_7d,
+          COUNT(*) FILTER (WHERE last_active_at >= now() - interval '30 days') AS active_30d
+        FROM users`),
+      pool.query(`
+        SELECT
+          COUNT(DISTINCT device_id) AS ever,
+          COUNT(DISTINCT device_id) FILTER (WHERE created_at >= now() - interval '1 day') AS d1,
+          COUNT(DISTINCT device_id) FILTER (WHERE created_at >= now() - interval '7 days') AS d7,
+          COUNT(DISTINCT device_id) FILTER (WHERE created_at >= now() - interval '30 days') AS d30
+        FROM events WHERE device_id IS NOT NULL`),
+      pool.query(`
+        WITH ${STUDY_DATA_CTE}
+        SELECT
+          (SELECT COUNT(*) FROM ex) AS exams,
+          (SELECT COUNT(*) FROM ch) AS topics,
+          (SELECT COUNT(*) FROM ch WHERE ${TOPIC_DONE}) AS topics_done,
+          (SELECT COUNT(*) FROM ch WHERE ${TOPIC_HAS_NOTE}) AS notes,
+          (SELECT COUNT(*) FROM se) AS sessions,
+          (SELECT COUNT(*) FROM se WHERE ${SESSION_DONE}) AS sessions_done,
+          (SELECT COUNT(DISTINCT user_id) FROM ex) AS users_with_exams`),
+      pool.query(`SELECT event_type, COUNT(*) AS n FROM events GROUP BY event_type`),
+      pool.query(`
+        SELECT
+          COUNT(*) FILTER (WHERE kind = 'feedback') AS feedback,
+          COUNT(*) FILTER (WHERE kind = 'bug') AS bugs,
+          COUNT(*) FILTER (WHERE created_at >= now() - interval '7 days') AS last_7d
+        FROM feedback`),
     ]);
 
+    const u = users.rows[0], d = devices.rows[0], st = study.rows[0], f = fb.rows[0];
+    const ev = Object.fromEntries(events.rows.map((r) => [r.event_type, Number(r.n)]));
+    const n = (v) => Number(v || 0);
+
+    await logEvent(null, req.userId, "admin_panel_viewed", {});
+
     res.json({
-      registeredUsers: Number(usersTotal.rows[0].n),
-      newUsersToday: Number(usersToday.rows[0].n),
-      newUsersThisWeek: Number(usersWeek.rows[0].n),
-      devicesEverSeen: Number(devicesTotal.rows[0].n),
-      activeToday: Number(activeToday.rows[0].n),
-      activeThisWeek: Number(activeWeek.rows[0].n),
-      eventCountsLast30Days: eventsByType.rows.map((r) => ({ eventType: r.event_type, count: Number(r.n) })),
+      timezone: ADMIN_TZ,
+      users: {
+        total: n(u.total), newToday: n(u.new_today), new7d: n(u.new_7d), new30d: n(u.new_30d),
+        active1d: n(u.active_1d), active7d: n(u.active_7d), active30d: n(u.active_30d),
+      },
+      devices: { ever: n(d.ever), active1d: n(d.d1), active7d: n(d.d7), active30d: n(d.d30) },
+      study: {
+        exams: n(st.exams), usersWithExams: n(st.users_with_exams),
+        topics: n(st.topics), topicsCompleted: n(st.topics_done), notes: n(st.notes),
+        sessions: n(st.sessions), sessionsCompleted: n(st.sessions_done),
+      },
+      activity: {
+        focusSessions: ev.focus_session_completed || 0,
+        studyPlansCreated: ev.study_plan_created || 0,
+        syllabusUploads: ev.syllabus_uploaded || 0,
+        dateSheetUploads: ev.date_sheet_uploaded || 0,
+        failedUploads: ev.upload_failed || 0,
+      },
+      feedback: { feedback: n(f.feedback), bugs: n(f.bugs), last7d: n(f.last_7d) },
     });
   } catch (e) {
     console.error("admin overview error", e);
     res.status(500).json({ error: "Couldn't load overview." });
+  }
+});
+
+// Daily series for charts: new sign-ups, active devices, active logged-in users, and each event type.
+app.get("/api/admin/activity", requireAdmin, async (req, res) => {
+  try {
+    const days = Math.min(90, Math.max(7, Number(req.query.days) || 30));
+    const series = await pool.query(
+      `
+      WITH d AS (
+        SELECT generate_series(
+          (date_trunc('day', now() AT TIME ZONE '${ADMIN_TZ}') - ($1::int - 1) * interval '1 day')::date,
+          (now() AT TIME ZONE '${ADMIN_TZ}')::date,
+          interval '1 day'
+        )::date AS day
+      ),
+      signups AS (
+        SELECT (created_at AT TIME ZONE '${ADMIN_TZ}')::date AS day, COUNT(*) AS n FROM users GROUP BY 1
+      ),
+      act AS (
+        SELECT (created_at AT TIME ZONE '${ADMIN_TZ}')::date AS day,
+               COUNT(DISTINCT device_id) AS devices,
+               COUNT(DISTINCT user_id) AS users
+        FROM events WHERE event_type <> 'admin_panel_viewed' GROUP BY 1
+      )
+      SELECT d.day::text AS day, COALESCE(signups.n, 0) AS signups, COALESCE(act.devices, 0) AS devices, COALESCE(act.users, 0) AS users
+      FROM d LEFT JOIN signups USING (day) LEFT JOIN act USING (day) ORDER BY d.day`,
+      [days]
+    );
+    const byType = await pool.query(
+      `SELECT event_type, COUNT(*) AS n FROM events
+       WHERE created_at >= now() - ($1::int * interval '1 day') AND event_type <> 'admin_panel_viewed'
+       GROUP BY event_type ORDER BY n DESC`,
+      [days]
+    );
+    res.json({
+      timezone: ADMIN_TZ,
+      days: series.rows.map((r) => ({
+        date: String(r.day).slice(0, 10),
+        signups: Number(r.signups), activeDevices: Number(r.devices), activeUsers: Number(r.users),
+      })),
+      featureUsage: byType.rows.map((r) => ({ eventType: r.event_type, count: Number(r.n) })),
+    });
+  } catch (e) {
+    console.error("admin activity error", e);
+    res.status(500).json({ error: "Couldn't load activity." });
+  }
+});
+
+// Account-level list. Never returns password hashes or study content — only counts.
+app.get("/api/admin/users", requireAdmin, async (req, res) => {
+  try {
+    const limit = Math.min(100, Math.max(1, Number(req.query.limit) || 25));
+    const page = Math.max(1, Number(req.query.page) || 1);
+    const q = typeof req.query.q === "string" ? req.query.q.trim().slice(0, 100) : "";
+    const params = [limit, (page - 1) * limit];
+    let where = "";
+    if (q) { params.push(`%${q}%`); where = `WHERE u.name ILIKE $3 OR u.email ILIKE $3`; }
+
+    const [rows, total] = await Promise.all([
+      pool.query(
+        `
+        WITH ${STUDY_DATA_CTE},
+        exs AS (SELECT user_id, COUNT(*) AS n FROM ex GROUP BY user_id),
+        chs AS (SELECT user_id, COUNT(*) AS n, COUNT(*) FILTER (WHERE ${TOPIC_DONE}) AS done FROM ch GROUP BY user_id),
+        ses AS (SELECT user_id, COUNT(*) AS n, COUNT(*) FILTER (WHERE ${SESSION_DONE}) AS done FROM se GROUP BY user_id)
+        SELECT u.id, u.name, u.email, u.created_at, u.last_active_at, u.is_admin,
+               COALESCE(exs.n, 0) AS exams, COALESCE(chs.n, 0) AS topics, COALESCE(chs.done, 0) AS topics_done,
+               COALESCE(ses.n, 0) AS sessions, COALESCE(ses.done, 0) AS sessions_done,
+               ud.updated_at AS data_updated_at
+        FROM users u
+        LEFT JOIN exs ON exs.user_id = u.id
+        LEFT JOIN chs ON chs.user_id = u.id
+        LEFT JOIN ses ON ses.user_id = u.id
+        LEFT JOIN user_data ud ON ud.user_id = u.id
+        ${where}
+        ORDER BY u.created_at DESC
+        LIMIT $1 OFFSET $2`,
+        params
+      ),
+      pool.query(`SELECT COUNT(*) AS n FROM users u ${q ? "WHERE u.name ILIKE $1 OR u.email ILIKE $1" : ""}`, q ? [`%${q}%`] : []),
+    ]);
+    res.json({
+      page, limit, total: Number(total.rows[0].n),
+      users: rows.rows.map((r) => ({
+        id: r.id, name: r.name, email: r.email, isAdmin: r.is_admin === true,
+        createdAt: r.created_at, lastActiveAt: r.last_active_at, dataUpdatedAt: r.data_updated_at,
+        exams: Number(r.exams), topics: Number(r.topics), topicsCompleted: Number(r.topics_done),
+        sessions: Number(r.sessions), sessionsCompleted: Number(r.sessions_done),
+      })),
+    });
+  } catch (e) {
+    console.error("admin users error", e);
+    res.status(500).json({ error: "Couldn't load users." });
+  }
+});
+
+app.get("/api/admin/feedback", requireAdmin, async (req, res) => {
+  try {
+    const limit = Math.min(200, Math.max(1, Number(req.query.limit) || 50));
+    const kind = req.query.kind === "bug" || req.query.kind === "feedback" ? req.query.kind : null;
+    const result = await pool.query(
+      `SELECT f.id, f.kind, f.message, f.page, f.user_agent, f.created_at, u.name AS user_name, u.email AS user_email
+       FROM feedback f LEFT JOIN users u ON u.id = f.user_id
+       ${kind ? "WHERE f.kind = $2" : ""}
+       ORDER BY f.created_at DESC LIMIT $1`,
+      kind ? [limit, kind] : [limit]
+    );
+    res.json({ items: result.rows });
+  } catch (e) {
+    console.error("admin feedback error", e);
+    res.status(500).json({ error: "Couldn't load feedback." });
   }
 });
 
@@ -456,32 +712,32 @@ app.get("/api/admin/health", requireAdmin, async (req, res) => {
     dbOk = false;
   }
   const dbLatencyMs = Date.now() - startedAt;
-  let errorCountToday = 0;
+  let errorCountToday = 0, lastError = null, dbSizeBytes = null;
   try {
-    const r = await pool.query(`SELECT COUNT(*) AS n FROM events WHERE event_type = 'api_error' AND created_at >= now() - interval '1 day'`);
+    const r = await pool.query(`SELECT COUNT(*) AS n, MAX(created_at) AS last FROM events WHERE event_type = 'api_error' AND created_at >= now() - interval '1 day'`);
     errorCountToday = Number(r.rows[0].n);
+    lastError = r.rows[0].last;
+    const sz = await pool.query(`SELECT pg_database_size(current_database()) AS b`);
+    dbSizeBytes = Number(sz.rows[0].b);
   } catch (e) { /* ignore */ }
 
   res.json({
     status: dbOk ? (errorCountToday > 20 ? "warning" : "healthy") : "critical",
     database: dbOk ? "connected" : "unreachable",
     databaseLatencyMs: dbLatencyMs,
+    databaseSizeBytes: dbSizeBytes,
     processUptimeSeconds: Math.round(process.uptime()),
+    nodeVersion: process.version,
+    smartImportConfigured: Boolean(GEMINI_API_KEY),
     errorCountToday,
+    lastErrorAt: lastError,
   });
 });
 
 app.get("/health", (req, res) => res.json({ ok: true }));
 
 initDb()
-  .then(async () => {
-    if (process.env.RUN_DB_MIGRATION === "yes") {
-      try {
-        await require("./migrate")();
-      } catch (e) {
-        console.error("MIGRATION FAILED:", e.message);
-      }
-    }
+  .then(() => {
     app.listen(PORT, () => console.log(`ExamFlow API listening on port ${PORT}`));
   })
   .catch((e) => {

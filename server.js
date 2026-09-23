@@ -527,7 +527,8 @@ function mergeExtractionPasses(passResults) {
   }));
 }
 
-app.post("/api/import/analyze", importLimiter, optionalAuth, async (req, res) => {
+// Smart Import is for signed-in students only (it also costs money per request, so it must not be open to anyone).
+app.post("/api/import/analyze", importLimiter, requireAuth, async (req, res) => {
   try {
     if (!GEMINI_API_KEY) {
       return res.status(503).json({ error: "Smart Import isn't set up yet. Please try again later." });

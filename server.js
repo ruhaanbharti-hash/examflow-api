@@ -328,6 +328,9 @@ app.get("/api/me", requireAuth, async (req, res) => {
 
 /* ---------------- data sync routes (account holders only) ---------------- */
 
+// Parts of a student's saved data. exams/sessions/settings are the original ones; tasks, notes and schedule are new.
+const DATA_KEYS = { exams: "array", sessions: "array", settings: "object", tasks: "array", notes: "array", schedule: "array" };
+
 app.get("/api/data", requireAuth, async (req, res) => {
   try {
     const result = await pool.query("SELECT data FROM user_data WHERE user_id = $1", [req.userId]);
@@ -341,16 +344,24 @@ app.get("/api/data", requireAuth, async (req, res) => {
 
 app.put("/api/data", requireAuth, async (req, res) => {
   try {
-    const { exams, sessions, settings } = req.body || {};
-    const data = {
-      exams: Array.isArray(exams) ? exams : [],
-      sessions: Array.isArray(sessions) ? sessions : [],
-      settings: settings && typeof settings === "object" ? settings : {},
-    };
+    // Only the parts a client sends are replaced; everything else in the student's saved data is kept.
+    // This lets older and newer versions of the app save side by side without erasing each other's data
+    // (e.g. the older app only knows exams/sessions/settings and must not wipe tasks or notes).
+    const body = req.body || {};
+    const patch = {};
+    for (const [key, kind] of Object.entries(DATA_KEYS)) {
+      if (body[key] === undefined) continue;
+      const v = body[key];
+      if (kind === "array" && !Array.isArray(v)) return res.status(400).json({ error: `Invalid ${key}.` });
+      if (kind === "object" && (!v || typeof v !== "object" || Array.isArray(v))) return res.status(400).json({ error: `Invalid ${key}.` });
+      if (kind === "array" && v.length > 5000) return res.status(400).json({ error: `Too many ${key}.` });
+      patch[key] = v;
+    }
+    if (!Object.keys(patch).length) return res.status(400).json({ error: "Nothing to save." });
     await pool.query(
-      `INSERT INTO user_data (user_id, data, updated_at) VALUES ($1, $2, now())
-       ON CONFLICT (user_id) DO UPDATE SET data = EXCLUDED.data, updated_at = now()`,
-      [req.userId, data]
+      `INSERT INTO user_data (user_id, data, updated_at) VALUES ($1, $2::jsonb, now())
+       ON CONFLICT (user_id) DO UPDATE SET data = user_data.data || EXCLUDED.data, updated_at = now()`,
+      [req.userId, patch]
     );
     res.json({ ok: true });
   } catch (e) {

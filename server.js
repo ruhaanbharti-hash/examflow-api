@@ -11,6 +11,7 @@ const DATABASE_URL = process.env.DATABASE_URL;
 const JWT_SECRET = process.env.JWT_SECRET;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+const GEMINI_BASE = process.env.GEMINI_API_BASE || "https://generativelanguage.googleapis.com"; // overridable only for local testing
 // Email (Brevo). Verification and password reset switch on only when BREVO_API_KEY and EMAIL_FROM are set.
 const BREVO_API_KEY = process.env.BREVO_API_KEY || "";
 const BREVO_API_URL = process.env.BREVO_API_URL || "https://api.brevo.com/v3/smtp/email";
@@ -539,7 +540,7 @@ app.post("/api/auth/reset-password", codeLimiter, async (req, res) => {
 /* ---------------- data sync routes (account holders only) ---------------- */
 
 // Parts of a student's saved data. exams/sessions/settings are the original ones; tasks, notes and schedule are new.
-const DATA_KEYS = { exams: "array", sessions: "array", settings: "object", tasks: "array", notes: "array", schedule: "array" };
+const DATA_KEYS = { exams: "array", sessions: "array", settings: "object", tasks: "array", notes: "array", schedule: "array", quizzes: "array" };
 
 app.get("/api/data", requireAuth, async (req, res) => {
   try {
@@ -666,7 +667,7 @@ function normalizeName(name) {
 
 async function callGeminiOnce(parts, temperature) {
   const aiRes = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`,
+    `${GEMINI_BASE}/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -696,6 +697,7 @@ async function callGeminiOnce(parts, temperature) {
       subject: String(s.subject).trim(),
       examDate: typeof s.examDate === "string" && /^\d{4}-\d{2}-\d{2}$/.test(s.examDate) ? s.examDate : null,
       examTime: typeof s.examTime === "string" && /^\d{2}:\d{2}$/.test(s.examTime) ? s.examTime : null,
+      examName: typeof s.examName === "string" && s.examName.trim() ? s.examName.trim().slice(0, 80) : null,
       topics: Array.isArray(s.topics) ? s.topics.filter(Boolean).map((t) => String(t).trim()).slice(0, 80) : [],
     }));
 }
@@ -710,9 +712,11 @@ function mergeExtractionPasses(passResults) {
     subjects.forEach((s) => {
       const key = normalizeName(s.subject);
       if (!bySubject.has(key)) {
-        bySubject.set(key, { subject: s.subject, examDateVotes: {}, examTimeVotes: {}, topics: new Map() });
+        bySubject.set(key, { subject: s.subject, examDateVotes: {}, examTimeVotes: {}, examNameVotes: {}, topics: new Map(), seen: 0 });
       }
       const entry = bySubject.get(key);
+      entry.seen += 1;
+      if (s.examName) entry.examNameVotes[s.examName] = (entry.examNameVotes[s.examName] || 0) + 1;
       if (s.examDate) entry.examDateVotes[s.examDate] = (entry.examDateVotes[s.examDate] || 0) + 1;
       if (s.examTime) entry.examTimeVotes[s.examTime] = (entry.examTimeVotes[s.examTime] || 0) + 1;
       s.topics.forEach((t) => {
@@ -729,12 +733,20 @@ function mergeExtractionPasses(passResults) {
     return entries[0][0];
   };
 
-  return Array.from(bySubject.values()).map((entry) => ({
-    subject: entry.subject,
-    examDate: pickTopVote(entry.examDateVotes),
-    examTime: pickTopVote(entry.examTimeVotes),
-    topics: Array.from(entry.topics.values()),
-  }));
+  // A date is "uncertain" when the independent readings disagreed about it (or only some of them found one),
+  // so the student is asked to double-check it instead of it being trusted silently.
+  return Array.from(bySubject.values()).map((entry) => {
+    const dateVotes = Object.values(entry.examDateVotes);
+    const dateCount = dateVotes.reduce((a, n) => a + n, 0);
+    return {
+      subject: entry.subject,
+      examDate: pickTopVote(entry.examDateVotes),
+      examTime: pickTopVote(entry.examTimeVotes),
+      examName: pickTopVote(entry.examNameVotes),
+      dateUncertain: dateVotes.length > 1 || (dateCount > 0 && dateCount < entry.seen),
+      topics: Array.from(entry.topics.values()),
+    };
+  });
 }
 
 // Smart Import is for signed-in students only (it also costs money per request, so it must not be open to anyone).
@@ -767,8 +779,9 @@ app.post("/api/import/analyze", importLimiter, requireAuth, async (req, res) => 
         `recognizing equivalent/abbreviated subject names as the same subject (for example: "Maths" = "Mathematics", "SST" = "Social Science", "EVS" = "Environmental Studies"). ` +
         `Today's date is ${today}; if a date sheet gives a day/month without a year, assume the nearest future occurrence. ` +
         `Respond with ONLY raw JSON (no markdown code fences, no explanation) matching exactly this shape:\n` +
-        `{"subjects":[{"subject":"string","examDate":"YYYY-MM-DD or null","examTime":"HH:MM 24-hour or null","topics":["string", ...]}]}\n` +
-        `Include every subject you can identify from either document, even if some fields are null.`,
+        `{"subjects":[{"subject":"string","examDate":"YYYY-MM-DD or null","examTime":"HH:MM 24-hour or null","examName":"exam name/type such as Half-Yearly, Unit Test 2, Final Exam, or null","topics":["string", ...]}]}\n` +
+        `Topics should be the chapters (or units, if there are no chapters) in the order they appear. ` +
+        `Include every subject you can identify from either document, even if some fields are null. Never guess a date that isn't in the document: use null instead.`,
     });
 
     const temperatures = [0.1, 0.4, 0.7];
@@ -793,6 +806,147 @@ app.post("/api/import/analyze", importLimiter, requireAuth, async (req, res) => 
     console.error("import analyze error", e);
     await logEvent((req.body || {}).deviceId, req.userId, "api_error", { route: "/api/import/analyze", message: e.message });
     res.status(500).json({ error: "Something went wrong analyzing your documents. Please try again." });
+  }
+});
+
+/* ---------------- AI study assistant + practice quizzes (Gemini, signed-in students only) ---------------- */
+// The Gemini key stays on the server. Each student's own subjects/chapters are loaded here from their account,
+// so one student's data can never be used for another. Daily limits protect the shared free quota.
+const AI_LIMITS = { ai_chat: 40, quiz_generated: 15 };
+const aiLimiter = rateLimit({ windowMs: 60 * 1000, max: 12, standardHeaders: true, legacyHeaders: false, message: { error: "Slow down a little — try again in a minute." } });
+
+async function aiQuotaLeft(userId, kind) {
+  const r = await pool.query(`SELECT COUNT(*) AS n FROM events WHERE user_id = $1 AND event_type = $2 AND created_at > now() - interval '1 day'`, [userId, kind]);
+  return AI_LIMITS[kind] - Number(r.rows[0].n);
+}
+
+async function callGemini({ system, contents, json = false, temperature = 0.6, maxTokens = 1400 }) {
+  const aiRes = await fetch(`${GEMINI_BASE}/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      systemInstruction: { parts: [{ text: system }] },
+      contents,
+      generationConfig: { temperature, maxOutputTokens: maxTokens, ...(json ? { responseMimeType: "application/json" } : {}) },
+    }),
+    signal: AbortSignal.timeout(45000),
+  });
+  if (!aiRes.ok) { console.error("Gemini error", aiRes.status, (await aiRes.text().catch(() => "")).slice(0, 300)); throw new Error("gemini_request_failed"); }
+  const j = await aiRes.json();
+  const text = j?.candidates?.[0]?.content?.parts?.map((p) => p.text).filter(Boolean).join("") || "";
+  if (!text) throw new Error("gemini_empty_response");
+  return text;
+}
+
+// A compact summary of the student's own syllabus, used as context.
+async function studyContext(userId) {
+  const r = await pool.query("SELECT data FROM user_data WHERE user_id = $1", [userId]);
+  const data = (r.rows[0] && r.rows[0].data) || {};
+  const exams = Array.isArray(data.exams) ? data.exams : [];
+  const label = { not_started: "not started", in_progress: "learning", completed: "completed", needs_revision: "needs revision", mastered: "mastered" };
+  const lines = exams.slice(0, 20).map((e) => {
+    const date = e.examDate && !Number.isNaN(new Date(e.examDate).getTime()) ? ` — ${e.examName || "exam"} on ${new Date(e.examDate).toISOString().slice(0, 10)}` : " — no exam date";
+    const ch = (Array.isArray(e.chapters) ? e.chapters : []).slice(0, 40)
+      .map((c) => `${String(c.name || "").slice(0, 80)} (${label[c.status] || (c.completed ? "completed" : "not started")}, ${c.difficulty || "Medium"})`).join("; ");
+    return `- ${String(e.subject || "").slice(0, 60)}${date}: ${ch || "no chapters yet"}`;
+  });
+  return { exams, text: lines.length ? lines.join("\n") : "The student hasn't added any subjects yet." };
+}
+
+const findChapter = (exams, examId, chapterId) => {
+  const e = exams.find((x) => x.id === examId);
+  const c = e && Array.isArray(e.chapters) ? e.chapters.find((x) => x.id === chapterId) : null;
+  return { exam: e || null, chapter: c || null };
+};
+
+app.post("/api/ai/chat", aiLimiter, requireAuth, async (req, res) => {
+  try {
+    if (!GEMINI_API_KEY) return res.status(503).json({ error: "The AI assistant isn't set up yet." });
+    const left = await aiQuotaLeft(req.userId, "ai_chat");
+    if (left <= 0) return res.status(429).json({ error: "You've reached today's limit for the AI assistant. It resets tomorrow." });
+    const body = req.body || {};
+    const history = (Array.isArray(body.messages) ? body.messages : []).slice(-12)
+      .filter((m) => m && typeof m.text === "string" && m.text.trim() && (m.role === "user" || m.role === "assistant"))
+      .map((m) => ({ role: m.role === "assistant" ? "model" : "user", parts: [{ text: m.text.slice(0, 2000) }] }));
+    if (!history.length || history[history.length - 1].role !== "user") return res.status(400).json({ error: "Type a question first." });
+    const ctx = await studyContext(req.userId);
+    const focus = body.focus && body.focus.examId ? findChapter(ctx.exams, body.focus.examId, body.focus.chapterId) : null;
+    const focusLine = focus && focus.exam ? `\nThe student is currently asking about: ${focus.exam.subject}${focus.chapter ? ` — ${focus.chapter.name}` : ""}.` : "";
+    const today = new Date().toISOString().slice(0, 10);
+    const system =
+      `You are the ExamFlow Study Assistant, helping a school student learn and revise. Today is ${today}.\n` +
+      `Style: friendly, encouraging and clear; short paragraphs or brief bullet lists; plain language; keep answers under about 220 words unless the student asks for more. ` +
+      `Use simple Markdown only (**bold**, bullet lists with "- ", numbered lists). No tables, no headings, no emojis overload.\n` +
+      `Teaching: explain step by step and check understanding. When asked to quiz, ask one question at a time and wait for the answer. ` +
+      `For homework, help the student understand how to solve it rather than only giving the final answer. If you're not sure about a fact, say so.\n` +
+      `"What should I study today?": use the student's subjects below — prefer chapters that need revision, are still being learned, or have the nearest exam dates.\n` +
+      `Stay on study-related topics. If a question isn't about studying, answer very briefly and steer back. Never help with cheating on a live test, and don't give harmful or adult content.\n` +
+      `The student's subjects and chapters (their own data):\n${ctx.text}${focusLine}`;
+    const reply = await callGemini({ system, contents: history, temperature: 0.6, maxTokens: 1200 });
+    await logEvent(null, req.userId, "ai_chat", { chars: reply.length });
+    res.json({ reply: reply.trim(), left: left - 1 });
+  } catch (e) {
+    console.error("ai chat error", e.message);
+    res.status(502).json({ error: "The assistant couldn't answer right now. Please try again in a moment." });
+  }
+});
+
+const QUIZ_TYPES = { mcq: "multiple-choice questions with 4 options each", short: "short-answer questions", tf: "true/false questions", mixed: "a mix of multiple-choice, true/false and short-answer questions", quick: "quick recall questions for fast revision (mostly multiple-choice and true/false)" };
+
+function cleanQuiz(raw, count) {
+  const qs = (Array.isArray(raw && raw.questions) ? raw.questions : []).slice(0, count);
+  const out = [];
+  for (const q of qs) {
+    if (!q || typeof q.question !== "string" || !q.question.trim()) continue;
+    const base = { question: q.question.trim().slice(0, 600), explanation: typeof q.explanation === "string" ? q.explanation.trim().slice(0, 600) : "", topic: typeof q.topic === "string" ? q.topic.trim().slice(0, 80) : "" };
+    if (q.type === "mcq" && Array.isArray(q.options) && q.options.length >= 2) {
+      const options = q.options.slice(0, 5).map((o) => String(o).trim().slice(0, 200)).filter(Boolean);
+      const answer = Number(q.answer);
+      if (options.length >= 2 && Number.isInteger(answer) && answer >= 0 && answer < options.length) out.push({ type: "mcq", ...base, options, answer });
+    } else if (q.type === "tf" && typeof q.answer === "boolean") {
+      out.push({ type: "tf", ...base, answer: q.answer });
+    } else if (q.type === "short" && (typeof q.answer === "string" || typeof q.answer === "number")) {
+      out.push({ type: "short", ...base, answer: String(q.answer).trim().slice(0, 400) });
+    }
+  }
+  return out;
+}
+
+app.post("/api/ai/quiz", aiLimiter, requireAuth, async (req, res) => {
+  try {
+    if (!GEMINI_API_KEY) return res.status(503).json({ error: "Practice quizzes aren't set up yet." });
+    const left = await aiQuotaLeft(req.userId, "quiz_generated");
+    if (left <= 0) return res.status(429).json({ error: "You've reached today's limit for practice quizzes. It resets tomorrow." });
+    const body = req.body || {};
+    const type = QUIZ_TYPES[body.type] ? body.type : "mixed";
+    const count = Math.min(10, Math.max(3, Number.parseInt(body.count, 10) || 5));
+    const level = ["easy", "medium", "hard"].includes(body.level) ? body.level : "medium";
+    const ctx = await studyContext(req.userId);
+    const { exam, chapter } = body.examId ? findChapter(ctx.exams, body.examId, body.chapterId) : { exam: null, chapter: null };
+    const customTopic = typeof body.topic === "string" ? body.topic.trim().slice(0, 150) : "";
+    const subject = exam ? exam.subject : (typeof body.subject === "string" ? body.subject.trim().slice(0, 60) : "");
+    const topic = chapter ? chapter.name : customTopic;
+    if (!topic && !subject) return res.status(400).json({ error: "Choose a chapter or type a topic." });
+    const system =
+      `You write accurate practice questions for school students. Only include questions you are confident are factually correct, ` +
+      `with one clearly correct answer. Keep wording clear and age-appropriate. Respond with ONLY JSON.`;
+    const prompt =
+      `Write ${count} ${QUIZ_TYPES[type]} at ${level} difficulty on ${topic ? `"${topic}"` : "the subject"}${subject ? ` (subject: ${subject})` : ""}.\n` +
+      `JSON shape: {"title":"string","questions":[{"type":"mcq"|"tf"|"short","question":"string","options":["A","B","C","D"] (mcq only),` +
+      `"answer": index of the correct option (mcq) | true/false (tf) | short model answer string (short),"explanation":"one or two sentences","topic":"the sub-topic this tests"}]}`;
+    const text = await callGemini({ system, contents: [{ role: "user", parts: [{ text: prompt }] }], json: true, temperature: 0.4, maxTokens: 3000 });
+    let parsed;
+    try { parsed = JSON.parse(text.replace(/^```json\s*|```\s*$/g, "").trim()); } catch (e) { throw new Error("quiz_parse_failed"); }
+    const questions = cleanQuiz(parsed, count);
+    if (questions.length < 2) return res.status(502).json({ error: "Couldn't make a good quiz for that topic. Try again or pick another chapter." });
+    await logEvent(null, req.userId, "quiz_generated", { type, count: questions.length });
+    res.json({
+      quiz: { title: typeof parsed.title === "string" ? parsed.title.slice(0, 120) : `${topic || subject} practice`, type, level, subject, topic, examId: exam ? exam.id : null, chapterId: chapter ? chapter.id : null, questions },
+      left: left - 1,
+    });
+  } catch (e) {
+    console.error("ai quiz error", e.message);
+    res.status(502).json({ error: "Couldn't create a quiz right now. Please try again in a moment." });
   }
 });
 
@@ -2015,3 +2169,4 @@ initDb()
     console.error("Failed to initialize database", e);
     process.exit(1);
   });
+    

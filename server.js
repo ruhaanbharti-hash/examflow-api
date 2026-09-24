@@ -4,12 +4,19 @@ const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const rateLimit = require("express-rate-limit");
 const { Pool } = require("pg");
+const crypto = require("crypto");
 
 const PORT = process.env.PORT || 4000;
 const DATABASE_URL = process.env.DATABASE_URL;
 const JWT_SECRET = process.env.JWT_SECRET;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+// Email (Brevo). Verification and password reset switch on only when BREVO_API_KEY and EMAIL_FROM are set.
+const BREVO_API_KEY = process.env.BREVO_API_KEY || "";
+const BREVO_API_URL = process.env.BREVO_API_URL || "https://api.brevo.com/v3/smtp/email";
+const EMAIL_FROM = process.env.EMAIL_FROM || "";
+const EMAIL_FROM_NAME = process.env.EMAIL_FROM_NAME || "ExamFlow";
+const EMAIL_ENABLED = Boolean(BREVO_API_KEY && EMAIL_FROM);
 const FRONTEND_ORIGINS = (process.env.FRONTEND_ORIGIN || "")
   .split(",")
   .map((s) => s.trim())
@@ -94,6 +101,24 @@ async function initDb() {
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS is_disabled BOOLEAN NOT NULL DEFAULT false;`);
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS disabled_at TIMESTAMPTZ;`);
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS disabled_reason TEXT;`);
+  // Email verification: accounts that existed before verification was introduced are treated as verified.
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN;`);
+  await pool.query(`UPDATE users SET email_verified = true WHERE email_verified IS NULL;`);
+  await pool.query(`ALTER TABLE users ALTER COLUMN email_verified SET DEFAULT false;`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS password_changed_at TIMESTAMPTZ;`);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS email_codes (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      purpose TEXT NOT NULL CHECK (purpose IN ('verify', 'reset')),
+      code_hash TEXT NOT NULL,
+      expires_at TIMESTAMPTZ NOT NULL,
+      attempts INTEGER NOT NULL DEFAULT 0,
+      used_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_email_codes_user ON email_codes(user_id, purpose, created_at);`);
   await pool.query(`ALTER TABLE feedback ADD COLUMN IF NOT EXISTS category TEXT;`);
   await pool.query(`ALTER TABLE feedback ADD COLUMN IF NOT EXISTS title TEXT;`);
   await pool.query(`ALTER TABLE feedback ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'new';`);
@@ -203,11 +228,13 @@ const userStateCache = new Map();
 async function userState(userId) {
   const hit = userStateCache.get(userId);
   if (hit && Date.now() - hit.at < 20000) return hit.state;
-  const r = await pool.query("SELECT is_disabled FROM users WHERE id = $1", [userId]);
-  const state = !r.rows[0] ? "missing" : r.rows[0].is_disabled === true ? "disabled" : "ok";
-  userStateCache.set(userId, { state, at: Date.now() });
+  const r = await pool.query("SELECT is_disabled, email_verified, password_changed_at FROM users WHERE id = $1", [userId]);
+  const row = r.rows[0];
+  const state = !row ? "missing" : row.is_disabled === true ? "disabled" : "ok";
+  const info = { state, verified: !row || row.email_verified !== false, pwChangedAt: row && row.password_changed_at ? new Date(row.password_changed_at).getTime() : 0 };
+  userStateCache.set(userId, { state: info, at: Date.now() });
   if (userStateCache.size > 5000) userStateCache.clear();
-  return state;
+  return info;
 }
 function forgetUserState(userId) { userStateCache.delete(userId); }
 const DISABLED_MSG = "This account has been disabled. If you think this is a mistake, please contact ExamFlow.";
@@ -218,7 +245,8 @@ async function optionalAuth(req, res, next) {
   if (token) {
     try {
       const payload = jwt.verify(token, JWT_SECRET);
-      if ((await userState(payload.sub)) === "ok") {
+      const st = await userState(payload.sub);
+      if (st.state === "ok" && !tokenPredatesPassword(payload, st)) {
         req.userId = payload.sub;
         touchActive(req.userId);
       }
@@ -227,7 +255,16 @@ async function optionalAuth(req, res, next) {
   next();
 }
 
-async function requireAuth(req, res, next) {
+// A token issued before the password was last changed (e.g. reset) is no longer valid.
+const tokenPredatesPassword = (payload, st) => Boolean(st.pwChangedAt && payload.iat && payload.iat * 1000 < st.pwChangedAt);
+const UNVERIFIED_MSG = "Please verify your email address to continue.";
+
+// requireAuth: a valid login for an active (and, when email is on, verified) account.
+// requireLogin: the same, but also lets unverified accounts through (for /api/me and the verification routes).
+function requireAuth(req, res, next) { return authCheck(req, res, next, true); }
+function requireLogin(req, res, next) { return authCheck(req, res, next, false); }
+
+async function authCheck(req, res, next, needVerified) {
   const header = req.headers.authorization || "";
   const token = header.startsWith("Bearer ") ? header.slice(7) : null;
   if (!token) return res.status(401).json({ error: "Please log in to continue." });
@@ -244,8 +281,9 @@ async function requireAuth(req, res, next) {
     console.error("userState error", e.message);
     return res.status(503).json({ error: "ExamFlow is having trouble right now. Please try again in a moment." });
   }
-  if (state === "missing") return res.status(401).json({ error: "Your session has expired. Please log in again." });
-  if (state === "disabled") return res.status(403).json({ error: DISABLED_MSG });
+  if (state.state === "missing" || tokenPredatesPassword(payload, state)) return res.status(401).json({ error: "Your session has expired. Please log in again." });
+  if (state.state === "disabled") return res.status(403).json({ error: DISABLED_MSG });
+  if (needVerified && EMAIL_ENABLED && !state.verified) return res.status(403).json({ error: UNVERIFIED_MSG, code: "email_unverified" });
   req.userId = payload.sub;
   req.tokenPayload = payload;
   touchActive(req.userId);
@@ -276,15 +314,17 @@ app.post("/api/auth/signup", async (req, res) => {
 
     const hash = await bcrypt.hash(password, 10);
     const result = await pool.query(
-      "INSERT INTO users (name, email, password_hash) VALUES ($1, $2, $3) RETURNING id, name, email, created_at",
-      [name.trim(), normalizedEmail, hash]
+      "INSERT INTO users (name, email, password_hash, email_verified) VALUES ($1, $2, $3, $4) RETURNING id, name, email, created_at",
+      [name.trim(), normalizedEmail, hash, !EMAIL_ENABLED]
     );
     const user = result.rows[0];
     await pool.query("INSERT INTO user_data (user_id, data) VALUES ($1, $2)", [user.id, EMPTY_DATA]);
 
     const token = signToken(user);
     await logEvent(req.body.deviceId, user.id, "user_registered", {});
-    res.json({ token, user: { id: user.id, name: user.name, email: user.email } });
+    let codeSent = false;
+    if (EMAIL_ENABLED) codeSent = await sendCode(user, "verify");
+    res.json({ token, user: { id: user.id, name: user.name, email: user.email, emailVerified: !EMAIL_ENABLED }, emailVerificationRequired: EMAIL_ENABLED, codeSent });
   } catch (e) {
     console.error("signup error", e);
     res.status(500).json({ error: "Something went wrong creating your account. Please try again." });
@@ -297,7 +337,7 @@ app.post("/api/auth/login", loginLimiter, async (req, res) => {
     if (!email || !password) return res.status(400).json({ error: "Please enter your email and password." });
 
     const normalizedEmail = email.trim().toLowerCase();
-    const result = await pool.query("SELECT id, name, email, password_hash, is_disabled FROM users WHERE email = $1", [normalizedEmail]);
+    const result = await pool.query("SELECT id, name, email, password_hash, is_disabled, email_verified FROM users WHERE email = $1", [normalizedEmail]);
     const user = result.rows[0];
     if (!user) return res.status(401).json({ error: "Incorrect email or password." });
 
@@ -307,22 +347,192 @@ app.post("/api/auth/login", loginLimiter, async (req, res) => {
 
     const token = signToken(user);
     await logEvent(req.body.deviceId, user.id, "user_login", {});
-    res.json({ token, user: { id: user.id, name: user.name, email: user.email } });
+    res.json({ token, user: { id: user.id, name: user.name, email: user.email, emailVerified: user.email_verified !== false || !EMAIL_ENABLED }, emailVerificationRequired: EMAIL_ENABLED });
   } catch (e) {
     console.error("login error", e);
     res.status(500).json({ error: "Something went wrong logging you in. Please try again." });
   }
 });
 
-app.get("/api/me", requireAuth, async (req, res) => {
+app.get("/api/me", requireLogin, async (req, res) => {
   try {
-    const result = await pool.query("SELECT id, name, email, created_at, is_admin FROM users WHERE id = $1", [req.userId]);
+    const result = await pool.query("SELECT id, name, email, created_at, is_admin, email_verified FROM users WHERE id = $1", [req.userId]);
     const row = result.rows[0];
     if (!row) return res.status(404).json({ error: "Account not found." });
-    res.json({ user: { id: row.id, name: row.name, email: row.email, created_at: row.created_at, isAdmin: row.is_admin === true } });
+    res.json({
+      user: { id: row.id, name: row.name, email: row.email, created_at: row.created_at, isAdmin: row.is_admin === true, emailVerified: row.email_verified !== false || !EMAIL_ENABLED },
+      emailVerificationRequired: EMAIL_ENABLED,
+    });
   } catch (e) {
     console.error("me error", e);
     res.status(500).json({ error: "Couldn't load your account." });
+  }
+});
+
+/* ---------------- email: verification codes and password reset ---------------- */
+const CODE_TTL_MIN = 15;
+const CODE_MAX_ATTEMPTS = 5;
+const hashCode = (code) => crypto.createHmac("sha256", JWT_SECRET).update(String(code)).digest("hex");
+const escapeHtml = (v) => String(v).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+async function sendEmail(to, subject, html, text) {
+  if (!EMAIL_ENABLED) return false;
+  try {
+    const r = await fetch(BREVO_API_URL, {
+      method: "POST",
+      headers: { "api-key": BREVO_API_KEY, "Content-Type": "application/json", accept: "application/json" },
+      body: JSON.stringify({ sender: { email: EMAIL_FROM, name: EMAIL_FROM_NAME }, to: [{ email: to }], subject, htmlContent: html, textContent: text }),
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!r.ok) { console.error("email send failed", r.status, (await r.text()).slice(0, 300)); return false; }
+    return true;
+  } catch (e) {
+    console.error("email send error", e.message);
+    return false;
+  }
+}
+
+function codeEmail(name, code, purpose) {
+  const verify = purpose === "verify";
+  const subject = verify ? `${code} is your ExamFlow verification code` : `${code} is your ExamFlow password reset code`;
+  const intro = verify ? "Welcome to ExamFlow! Enter this code to verify your email address:" : "We received a request to reset your ExamFlow password. Enter this code to choose a new one:";
+  const outro = verify ? "If you didn't create an ExamFlow account, you can ignore this email." : "If you didn't ask to reset your password, you can ignore this email. Your password won't change.";
+  const html = `<!doctype html><html><body style="margin:0;background:#F6F5FB;font-family:Arial,Helvetica,sans-serif;color:#17142B">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="padding:32px 12px"><tr><td align="center">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:480px;background:#fff;border-radius:18px;padding:32px">
+<tr><td style="font-size:20px;font-weight:800;color:#5B4FE8">🎓 ExamFlow</td></tr>
+<tr><td style="padding-top:20px;font-size:16px">Hi ${escapeHtml(name || "there")},</td></tr>
+<tr><td style="padding-top:8px;font-size:16px;line-height:1.5">${intro}</td></tr>
+<tr><td align="center" style="padding:24px 0"><div style="display:inline-block;font-size:34px;font-weight:800;letter-spacing:8px;background:#EEECFE;color:#4A3FD4;border-radius:14px;padding:14px 22px">${code}</div></td></tr>
+<tr><td style="font-size:14px;color:#4B4663;line-height:1.5">This code expires in ${CODE_TTL_MIN} minutes. ${outro}</td></tr>
+<tr><td style="padding-top:24px;font-size:12px;color:#8A86A6">ExamFlow · Your smarter study space</td></tr>
+</table></td></tr></table></body></html>`;
+  const text = `Hi ${name || "there"},\n\n${intro}\n\n${code}\n\nThis code expires in ${CODE_TTL_MIN} minutes. ${outro}\n\nExamFlow`;
+  return { subject, html, text };
+}
+
+// Creates a new single-use code (replacing earlier unused ones) and emails it. Returns whether the email was accepted.
+async function sendCode(user, purpose) {
+  const code = String(crypto.randomInt(0, 1000000)).padStart(6, "0");
+  await pool.query("UPDATE email_codes SET used_at = now() WHERE user_id = $1 AND purpose = $2 AND used_at IS NULL", [user.id, purpose]);
+  await pool.query(
+    `INSERT INTO email_codes (user_id, purpose, code_hash, expires_at) VALUES ($1, $2, $3, now() + interval '${CODE_TTL_MIN} minutes')`,
+    [user.id, purpose, hashCode(code)]
+  );
+  const m = codeEmail(user.name, code, purpose);
+  return sendEmail(user.email, m.subject, m.html, m.text);
+}
+
+// Checks a code. Returns "ok", or an error message for the student.
+async function checkCode(userId, purpose, code) {
+  const r = await pool.query(
+    "SELECT id, code_hash, expires_at, attempts FROM email_codes WHERE user_id = $1 AND purpose = $2 AND used_at IS NULL ORDER BY created_at DESC LIMIT 1",
+    [userId, purpose]
+  );
+  const row = r.rows[0];
+  if (!row) return "That code isn't valid. Ask for a new one.";
+  if (new Date(row.expires_at).getTime() < Date.now()) return "That code has expired. Ask for a new one.";
+  if (row.attempts >= CODE_MAX_ATTEMPTS) return "Too many wrong tries. Ask for a new code.";
+  const given = hashCode(String(code || "").replace(/\D/g, ""));
+  const match = given.length === row.code_hash.length && crypto.timingSafeEqual(Buffer.from(given), Buffer.from(row.code_hash));
+  if (!match) {
+    await pool.query("UPDATE email_codes SET attempts = attempts + 1 WHERE id = $1", [row.id]);
+    const left = CODE_MAX_ATTEMPTS - row.attempts - 1;
+    return left > 0 ? `That code isn't right. ${left} ${left === 1 ? "try" : "tries"} left.` : "Too many wrong tries. Ask for a new code.";
+  }
+  await pool.query("UPDATE email_codes SET used_at = now() WHERE id = $1", [row.id]);
+  return "ok";
+}
+
+// At most one code per minute and 5 per hour, per account and purpose.
+async function codeRateLimited(userId, purpose) {
+  const r = await pool.query(
+    `SELECT COUNT(*) FILTER (WHERE created_at > now() - interval '1 minute') AS m, COUNT(*) FILTER (WHERE created_at > now() - interval '1 hour') AS h
+     FROM email_codes WHERE user_id = $1 AND purpose = $2`,
+    [userId, purpose]
+  );
+  const m = Number(r.rows[0].m), h = Number(r.rows[0].h);
+  if (m > 0) return "Please wait a minute before asking for another code.";
+  if (h >= 5) return "You've asked for a lot of codes. Please try again in an hour.";
+  return null;
+}
+
+const codeLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 20, standardHeaders: true, legacyHeaders: false, message: { error: "Too many attempts. Please wait a few minutes and try again." } });
+
+app.post("/api/auth/verify-email", codeLimiter, requireLogin, async (req, res) => {
+  try {
+    if (!EMAIL_ENABLED) return res.json({ ok: true, emailVerified: true });
+    const u = (await pool.query("SELECT email_verified FROM users WHERE id = $1", [req.userId])).rows[0];
+    if (u && u.email_verified === true) return res.json({ ok: true, emailVerified: true });
+    const result = await checkCode(req.userId, "verify", (req.body || {}).code);
+    if (result !== "ok") return res.status(400).json({ error: result });
+    await pool.query("UPDATE users SET email_verified = true WHERE id = $1", [req.userId]);
+    forgetUserState(req.userId);
+    await logEvent(null, req.userId, "email_verified", {});
+    res.json({ ok: true, emailVerified: true });
+  } catch (e) {
+    console.error("verify error", e);
+    res.status(500).json({ error: "Couldn't verify your email. Please try again." });
+  }
+});
+
+app.post("/api/auth/resend-verification", codeLimiter, requireLogin, async (req, res) => {
+  try {
+    if (!EMAIL_ENABLED) return res.json({ ok: true });
+    const u = (await pool.query("SELECT id, name, email, email_verified FROM users WHERE id = $1", [req.userId])).rows[0];
+    if (u.email_verified === true) return res.json({ ok: true, emailVerified: true });
+    const limited = await codeRateLimited(u.id, "verify");
+    if (limited) return res.status(429).json({ error: limited });
+    const sent = await sendCode(u, "verify");
+    if (!sent) return res.status(502).json({ error: "We couldn't send the email right now. Please try again in a few minutes." });
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("resend error", e);
+    res.status(500).json({ error: "Couldn't send a new code. Please try again." });
+  }
+});
+
+// Always answers the same way, so it can't be used to find out which emails have accounts.
+app.post("/api/auth/forgot-password", codeLimiter, async (req, res) => {
+  const generic = { ok: true, message: "If an account exists for that email, we've sent a code to it." };
+  try {
+    if (!EMAIL_ENABLED) return res.status(503).json({ error: "Password reset isn't available yet. Please contact ExamFlow for help." });
+    const email = String((req.body || {}).email || "").trim().toLowerCase();
+    if (!EMAIL_RE.test(email)) return res.status(400).json({ error: "Please enter a valid email address." });
+    const u = (await pool.query("SELECT id, name, email, is_disabled FROM users WHERE email = $1", [email])).rows[0];
+    if (!u || u.is_disabled) return res.json(generic);
+    if (await codeRateLimited(u.id, "reset")) return res.json(generic);
+    await sendCode(u, "reset");
+    await logEvent(null, u.id, "password_reset_requested", {});
+    res.json(generic);
+  } catch (e) {
+    console.error("forgot error", e);
+    res.status(500).json({ error: "Something went wrong. Please try again." });
+  }
+});
+
+app.post("/api/auth/reset-password", codeLimiter, async (req, res) => {
+  try {
+    if (!EMAIL_ENABLED) return res.status(503).json({ error: "Password reset isn't available yet." });
+    const { email, code, password } = req.body || {};
+    const normalized = String(email || "").trim().toLowerCase();
+    if (!password || password.length < 6) return res.status(400).json({ error: "Password must be at least 6 characters." });
+    const u = (await pool.query("SELECT id, name, email, is_disabled, is_admin FROM users WHERE email = $1", [normalized])).rows[0];
+    if (!u) return res.status(400).json({ error: "That code isn't valid. Ask for a new one." });
+    if (u.is_disabled) return res.status(403).json({ error: DISABLED_MSG });
+    const result = await checkCode(u.id, "reset", code);
+    if (result !== "ok") return res.status(400).json({ error: result });
+    const hash = await bcrypt.hash(password, 10);
+    // Resetting proves the student owns the inbox, so it also verifies the email. Older logins stop working.
+    await pool.query("UPDATE users SET password_hash = $2, email_verified = true, password_changed_at = now() WHERE id = $1", [u.id, hash]);
+    forgetUserState(u.id);
+    await new Promise((r) => setTimeout(r, 1100)); // new login must be issued after the change time (1-second resolution)
+    const token = signToken(u);
+    await logEvent(null, u.id, "password_reset", {});
+    res.json({ token, user: { id: u.id, name: u.name, email: u.email, emailVerified: true } });
+  } catch (e) {
+    console.error("reset error", e);
+    res.status(500).json({ error: "Couldn't reset your password. Please try again." });
   }
 });
 
@@ -370,7 +580,7 @@ app.put("/api/data", requireAuth, async (req, res) => {
   }
 });
 
-app.delete("/api/account", requireAuth, async (req, res) => {
+app.delete("/api/account", requireLogin, async (req, res) => {
   try {
     await pool.query("DELETE FROM users WHERE id = $1", [req.userId]);
     res.json({ ok: true });

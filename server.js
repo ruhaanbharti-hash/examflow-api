@@ -665,24 +665,50 @@ function normalizeName(name) {
   return (name || "").trim().toLowerCase().replace(/\s+/g, " ");
 }
 
-async function callGeminiOnce(parts, temperature) {
-  const aiRes = await fetch(
-    `${GEMINI_BASE}/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        contents: [{ role: "user", parts }],
-        generationConfig: { temperature, responseMimeType: "application/json" },
-      }),
+// Google's free Gemini models are sometimes overloaded ("503 high demand") or briefly rate-limited (429).
+// Instead of failing straight away, each request retries with a short wait and then falls back to other
+// Gemini models, which have their own capacity and free quota.
+const GEMINI_MODELS = [...new Set([GEMINI_MODEL, ...(process.env.GEMINI_FALLBACK_MODELS || "gemini-2.5-flash-lite,gemini-flash-latest").split(",").map((m) => m.trim()).filter(Boolean)])];
+const RETRYABLE = new Set([429, 500, 502, 503, 504]);
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function geminiGenerate(body, timeoutMs) {
+  let lastStatus = 0;
+  for (const model of GEMINI_MODELS) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      let aiRes;
+      try {
+        aiRes = await fetch(`${GEMINI_BASE}/v1beta/models/${model}:generateContent?key=${GEMINI_API_KEY}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+          signal: AbortSignal.timeout(timeoutMs),
+        });
+      } catch (netErr) {
+        lastStatus = 0;
+        console.error("Gemini network error", model, netErr.name || netErr.message);
+        if (attempt === 0) { await sleep(1500); continue; }
+        break;
+      }
+      if (aiRes.ok) return aiRes.json();
+      lastStatus = aiRes.status;
+      const errText = (await aiRes.text().catch(() => "")).slice(0, 300);
+      console.error("Gemini API error", model, aiRes.status, errText);
+      if (aiRes.status === 404) break; // this model isn't available: try the next one
+      if (!RETRYABLE.has(aiRes.status)) { const e = new Error("gemini_request_failed"); e.status = aiRes.status; throw e; }
+      if (attempt === 0) await sleep(1500 + Math.floor(Math.random() * 1000));
     }
-  );
-  if (!aiRes.ok) {
-    const errText = await aiRes.text().catch(() => "");
-    console.error("Gemini API error", aiRes.status, errText);
-    throw new Error("gemini_request_failed");
   }
-  const aiJson = await aiRes.json();
+  const e = new Error(lastStatus === 503 || lastStatus === 429 ? "gemini_busy" : "gemini_request_failed");
+  e.status = lastStatus;
+  throw e;
+}
+
+async function callGeminiOnce(parts, temperature) {
+  const aiJson = await geminiGenerate({
+    contents: [{ role: "user", parts }],
+    generationConfig: { temperature, responseMimeType: "application/json" },
+  }, 90000);
   const textOut = aiJson?.candidates?.[0]?.content?.parts?.map((p) => p.text).filter(Boolean).join("") || "";
   if (!textOut) throw new Error("gemini_empty_response");
 
@@ -789,8 +815,11 @@ app.post("/api/import/analyze", importLimiter, requireAuth, async (req, res) => 
     const succeeded = results.filter((r) => r.status === "fulfilled").map((r) => r.value);
 
     if (succeeded.length === 0) {
-      await logEvent(deviceId, req.userId, "upload_failed", { reason: "all_passes_failed" });
-      return res.status(502).json({ error: "Couldn't analyze your documents right now. Please try again." });
+      const busy = results.some((r) => r.status === "rejected" && r.reason && r.reason.message === "gemini_busy");
+      await logEvent(deviceId, req.userId, "upload_failed", { reason: busy ? "ai_busy" : "all_passes_failed" });
+      return res.status(502).json({ error: busy
+        ? "Google's AI is very busy right now. Please wait a minute and try again — or add your subjects manually."
+        : "Couldn't analyze your documents right now. Please try again, or add your subjects manually." });
     }
 
     const merged = mergeExtractionPasses(succeeded);
@@ -821,18 +850,11 @@ async function aiQuotaLeft(userId, kind) {
 }
 
 async function callGemini({ system, contents, json = false, temperature = 0.6, maxTokens = 1400 }) {
-  const aiRes = await fetch(`${GEMINI_BASE}/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      systemInstruction: { parts: [{ text: system }] },
-      contents,
-      generationConfig: { temperature, maxOutputTokens: maxTokens, ...(json ? { responseMimeType: "application/json" } : {}) },
-    }),
-    signal: AbortSignal.timeout(45000),
-  });
-  if (!aiRes.ok) { console.error("Gemini error", aiRes.status, (await aiRes.text().catch(() => "")).slice(0, 300)); throw new Error("gemini_request_failed"); }
-  const j = await aiRes.json();
+  const j = await geminiGenerate({
+    systemInstruction: { parts: [{ text: system }] },
+    contents,
+    generationConfig: { temperature, maxOutputTokens: maxTokens, ...(json ? { responseMimeType: "application/json" } : {}) },
+  }, 45000);
   const text = j?.candidates?.[0]?.content?.parts?.map((p) => p.text).filter(Boolean).join("") || "";
   if (!text) throw new Error("gemini_empty_response");
   return text;
@@ -2169,4 +2191,3 @@ initDb()
     console.error("Failed to initialize database", e);
     process.exit(1);
   });
-    

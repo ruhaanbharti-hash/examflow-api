@@ -665,17 +665,48 @@ function normalizeName(name) {
   return (name || "").trim().toLowerCase().replace(/\s+/g, " ");
 }
 
-// Google's free Gemini models are sometimes overloaded ("503 high demand") or briefly rate-limited (429).
-// Instead of failing straight away, each request retries with a short wait and then falls back to other
-// Gemini models, which have their own capacity and free quota.
-const GEMINI_MODELS = [...new Set([GEMINI_MODEL, ...(process.env.GEMINI_FALLBACK_MODELS || "gemini-2.5-flash-lite,gemini-flash-latest").split(",").map((m) => m.trim()).filter(Boolean)])];
+// ---- ExamFlow AI: provider layer ----
+// Students only ever see "ExamFlow AI". Behind it, requests go to Gemini first (retrying and trying other
+// Gemini models when one is overloaded), then to a backup provider (Groq, and optionally OpenRouter) if every
+// Gemini model is busy or failing. Keys stay on the server; no provider or model name is ever sent to the browser.
+const GEMINI_MODELS = [...new Set([GEMINI_MODEL, ...(process.env.GEMINI_FALLBACK_MODELS || "gemini-3.5-flash-lite,gemini-3.1-flash-lite,gemini-3.5-flash").split(",").map((m) => m.trim()).filter(Boolean)])];
 const RETRYABLE = new Set([429, 500, 502, 503, 504]);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const GEMINI_SKIP_MS = 2 * 60 * 1000;
+let geminiBusyUntil = 0; // after every Gemini model was busy, go straight to the backup for a couple of minutes
 
-async function geminiGenerate(body, timeoutMs) {
+const BACKUPS = [
+  process.env.GROQ_API_KEY && {
+    name: "groq",
+    url: `${process.env.GROQ_API_BASE || "https://api.groq.com/openai"}/v1/chat/completions`,
+    key: process.env.GROQ_API_KEY,
+    text: process.env.GROQ_TEXT_MODEL || "openai/gpt-oss-120b",
+    vision: process.env.GROQ_VISION_MODEL || "qwen/qwen3.8-27b",
+    maxChars: 18000, // free plan has a small per-minute token allowance
+  },
+  process.env.OPENROUTER_API_KEY && {
+    name: "openrouter",
+    url: `${process.env.OPENROUTER_API_BASE || "https://openrouter.ai/api"}/v1/chat/completions`,
+    key: process.env.OPENROUTER_API_KEY,
+    text: process.env.OPENROUTER_TEXT_MODEL || "openrouter/free",
+    vision: process.env.OPENROUTER_VISION_MODEL || "google/gemma-4-31b-it:free",
+    maxChars: 40000,
+  },
+].filter(Boolean);
+const AI_CONFIGURED = Boolean(GEMINI_API_KEY || BACKUPS.length);
+
+function aiError(code, extra = {}) { const e = new Error(code); Object.assign(e, extra); return e; }
+
+async function geminiGenerate(body, timeoutMs, deadlineMs = 40000) {
+  if (!GEMINI_API_KEY) throw aiError("ai_not_configured");
+  if (Date.now() < geminiBusyUntil) throw aiError("ai_busy");
+  const deadline = Date.now() + deadlineMs;
   let lastStatus = 0;
-  for (const model of GEMINI_MODELS) {
-    for (let attempt = 0; attempt < 2; attempt++) {
+  let allBusy = true;
+  outer: for (const [i, model] of GEMINI_MODELS.entries()) {
+    const attempts = i === 0 ? 2 : 1;
+    for (let attempt = 0; attempt < attempts; attempt++) {
+      if (Date.now() > deadline) break outer;
       let aiRes;
       try {
         aiRes = await fetch(`${GEMINI_BASE}/v1beta/models/${model}:generateContent?key=${GEMINI_API_KEY}`, {
@@ -686,36 +717,133 @@ async function geminiGenerate(body, timeoutMs) {
         });
       } catch (netErr) {
         lastStatus = 0;
-        console.error("Gemini network error", model, netErr.name || netErr.message);
-        if (attempt === 0) { await sleep(1500); continue; }
-        break;
+        console.error("AI primary network error", model, netErr.name || netErr.message);
+        continue;
       }
       if (aiRes.ok) return aiRes.json();
       lastStatus = aiRes.status;
       const errText = (await aiRes.text().catch(() => "")).slice(0, 300);
-      console.error("Gemini API error", model, aiRes.status, errText);
-      if (aiRes.status === 404) break; // this model isn't available: try the next one
-      if (!RETRYABLE.has(aiRes.status)) { const e = new Error("gemini_request_failed"); e.status = aiRes.status; throw e; }
-      if (attempt === 0) await sleep(1500 + Math.floor(Math.random() * 1000));
+      console.error("AI primary error", model, aiRes.status, errText);
+      if (aiRes.status === 404) break; // model retired or unavailable: try the next one
+      if (!RETRYABLE.has(aiRes.status)) { allBusy = false; break outer; }
+      if (attempt + 1 < attempts) await sleep(1200 + Math.floor(Math.random() * 800));
     }
   }
-  const e = new Error(lastStatus === 503 || lastStatus === 429 ? "gemini_busy" : "gemini_request_failed");
-  e.status = lastStatus;
-  throw e;
+  if (allBusy && (lastStatus === 503 || lastStatus === 429)) geminiBusyUntil = Date.now() + GEMINI_SKIP_MS;
+  throw aiError(lastStatus === 503 || lastStatus === 429 ? "ai_busy" : "ai_failed", { status: lastStatus });
 }
 
-async function callGeminiOnce(parts, temperature) {
-  const aiJson = await geminiGenerate({
-    contents: [{ role: "user", parts }],
-    generationConfig: { temperature, responseMimeType: "application/json" },
-  }, 90000);
-  const textOut = aiJson?.candidates?.[0]?.content?.parts?.map((p) => p.text).filter(Boolean).join("") || "";
-  if (!textOut) throw new Error("gemini_empty_response");
+const geminiText = (j) => j?.candidates?.[0]?.content?.parts?.map((p) => p.text).filter(Boolean).join("") || "";
 
-  let cleaned = textOut.trim();
-  cleaned = cleaned.replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/```\s*$/i, "").trim();
+// Pulls the text layer out of a PDF so the backup can read it. Scanned PDFs have no text layer.
+let pdfjs = null;
+async function pdfToText(base64) {
+  if (!pdfjs) pdfjs = require("pdfjs-dist/legacy/build/pdf.js");
+  const doc = await pdfjs.getDocument({ data: new Uint8Array(Buffer.from(base64, "base64")), disableFontFace: true, isEvalSupported: false, verbosity: 0 }).promise;
+  const pages = [];
+  try {
+    for (let i = 1; i <= Math.min(doc.numPages, 40); i++) {
+      const page = await doc.getPage(i);
+      const content = await page.getTextContent();
+      pages.push(content.items.map((it) => (it.str || "") + (it.hasEOL ? "\n" : " ")).join(""));
+    }
+  } finally {
+    await doc.destroy().catch(() => {});
+  }
+  return pages.join("\n").replace(/[ \t]+/g, " ").replace(/\n{3,}/g, "\n\n").trim();
+}
 
-  const parsed = JSON.parse(cleaned);
+const stripThinking = (t) => String(t || "").replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
+
+// messages: [{ role: "user"|"assistant", text }]; files (optional, attached to the last user message): [{ label, mediaType, base64 }]
+async function backupGenerate({ system, messages, files = [], json = false, temperature = 0.6, maxTokens = 1400, timeoutMs = 60000 }) {
+  if (!BACKUPS.length) throw aiError("ai_busy");
+  const docTexts = [];
+  const images = [];
+  for (const f of files) {
+    if (f.mediaType === "application/pdf") {
+      let t = "";
+      try { t = await pdfToText(f.base64); } catch (e) { console.error("pdf text error", e.message); }
+      if (t.replace(/\s/g, "").length < 40) throw aiError("pdf_no_text");
+      docTexts.push({ label: f.label, text: t });
+    } else {
+      images.push(f);
+    }
+  }
+  let lastErr = aiError("ai_busy");
+  for (const b of BACKUPS) {
+    const budget = b.maxChars;
+    const perDoc = docTexts.length ? Math.floor(budget / docTexts.length) : 0;
+    const docsBlock = docTexts.map((d) => `${d.label}:\n"""\n${d.text.slice(0, perDoc)}\n"""`).join("\n\n");
+    const msgs = [{ role: "system", content: system }];
+    messages.forEach((m, idx) => {
+      const isLast = idx === messages.length - 1;
+      if (!isLast || (!docsBlock && !images.length)) { msgs.push({ role: m.role === "assistant" ? "assistant" : "user", content: m.text }); return; }
+      const content = [];
+      const imageNote = images.map((im, k) => `Image ${k + 1} is the ${im.label}.`).join(" ");
+      content.push({ type: "text", text: [docsBlock, imageNote, m.text].filter(Boolean).join("\n\n") });
+      images.forEach((im) => content.push({ type: "image_url", image_url: { url: `data:${im.mediaType};base64,${im.base64}` } }));
+      msgs.push({ role: "user", content: images.length ? content : content[0].text });
+    });
+    const model = images.length ? b.vision : b.text;
+    const payload = { model, messages: msgs, temperature, max_tokens: Math.min(6000, maxTokens + 1500) };
+    for (const withFormat of json ? [true, false] : [false]) {
+      try {
+        const r = await fetch(b.url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${b.key}` },
+          body: JSON.stringify(withFormat ? { ...payload, response_format: { type: "json_object" } } : payload),
+          signal: AbortSignal.timeout(timeoutMs),
+        });
+        if (r.ok) {
+          const j = await r.json();
+          const text = stripThinking(j?.choices?.[0]?.message?.content);
+          if (text) { console.log("AI answered by backup", b.name); return text; }
+          lastErr = aiError("ai_failed");
+          break;
+        }
+        const errText = (await r.text().catch(() => "")).slice(0, 300);
+        console.error("AI backup error", b.name, model, r.status, errText);
+        lastErr = aiError(RETRYABLE.has(r.status) ? "ai_busy" : "ai_failed", { status: r.status });
+        if (r.status === 400 && withFormat) continue; // some models reject JSON mode: retry without it
+        break;
+      } catch (netErr) {
+        console.error("AI backup network error", b.name, netErr.name || netErr.message);
+        lastErr = aiError("ai_busy");
+        break;
+      }
+    }
+  }
+  throw lastErr;
+}
+
+// One call that tries Gemini, then the backup. Used by the assistant and quizzes.
+async function aiGenerate({ system, messages, json = false, temperature = 0.6, maxTokens = 1400 }) {
+  try {
+    const j = await geminiGenerate({
+      systemInstruction: { parts: [{ text: system }] },
+      contents: messages.map((m) => ({ role: m.role === "assistant" ? "model" : "user", parts: [{ text: m.text }] })),
+      generationConfig: { temperature, maxOutputTokens: maxTokens, ...(json ? { responseMimeType: "application/json" } : {}) },
+    }, 45000);
+    const text = geminiText(j);
+    if (text) return text;
+    throw aiError("ai_failed");
+  } catch (primaryErr) {
+    if (!BACKUPS.length) throw primaryErr;
+    return backupGenerate({ system, messages, json, temperature, maxTokens });
+  }
+}
+
+function parseJsonLoose(text) {
+  let cleaned = String(text || "").trim().replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/```\s*$/i, "").trim();
+  try { return JSON.parse(cleaned); } catch (e) { /* fall through */ }
+  const a = cleaned.indexOf("{"), b = cleaned.lastIndexOf("}");
+  if (a >= 0 && b > a) return JSON.parse(cleaned.slice(a, b + 1));
+  throw aiError("ai_bad_json");
+}
+
+function parseSubjects(text) {
+  const parsed = parseJsonLoose(text);
   const subjects = Array.isArray(parsed.subjects) ? parsed.subjects : [];
   return subjects
     .filter((s) => s && s.subject)
@@ -726,6 +854,16 @@ async function callGeminiOnce(parts, temperature) {
       examName: typeof s.examName === "string" && s.examName.trim() ? s.examName.trim().slice(0, 80) : null,
       topics: Array.isArray(s.topics) ? s.topics.filter(Boolean).map((t) => String(t).trim()).slice(0, 80) : [],
     }));
+}
+
+async function callGeminiOnce(parts, temperature) {
+  const aiJson = await geminiGenerate({
+    contents: [{ role: "user", parts }],
+    generationConfig: { temperature, responseMimeType: "application/json" },
+  }, 90000);
+  const textOut = geminiText(aiJson);
+  if (!textOut) throw aiError("ai_failed");
+  return parseSubjects(textOut);
 }
 
 // Merges 2-3 independent extraction passes into one result: union of subjects, union of topics per
@@ -778,7 +916,7 @@ function mergeExtractionPasses(passResults) {
 // Smart Import is for signed-in students only (it also costs money per request, so it must not be open to anyone).
 app.post("/api/import/analyze", importLimiter, requireAuth, async (req, res) => {
   try {
-    if (!GEMINI_API_KEY) {
+    if (!AI_CONFIGURED) {
       return res.status(503).json({ error: "Smart Import isn't set up yet. Please try again later." });
     }
     const { syllabusFile, datesheetFile, deviceId } = req.body || {};
@@ -814,12 +952,31 @@ app.post("/api/import/analyze", importLimiter, requireAuth, async (req, res) => 
     const results = await Promise.allSettled(temperatures.map((t) => callGeminiOnce(parts, t)));
     const succeeded = results.filter((r) => r.status === "fulfilled").map((r) => r.value);
 
+    // Every primary reading failed (usually "busy"): make one reading with the backup instead.
+    let backupErr = null;
+    if (succeeded.length === 0 && BACKUPS.length) {
+      const files = [];
+      if (datesheetFile && datesheetFile.base64) files.push({ label: "DATE SHEET (exam schedule)", mediaType: datesheetFile.mediaType, base64: datesheetFile.base64 });
+      if (syllabusFile && syllabusFile.base64) files.push({ label: "SYLLABUS (chapters/topics)", mediaType: syllabusFile.mediaType, base64: syllabusFile.base64 });
+      try {
+        const text = await backupGenerate({
+          system: "You extract academic schedule information from school documents and reply with only JSON.",
+          messages: [{ role: "user", text: parts[parts.length - 1].text }],
+          files, json: true, temperature: 0.1, maxTokens: 4000, timeoutMs: 90000,
+        });
+        succeeded.push(parseSubjects(text));
+      } catch (e) {
+        backupErr = e;
+        console.error("import backup failed", e.message);
+      }
+    }
+
     if (succeeded.length === 0) {
-      const busy = results.some((r) => r.status === "rejected" && r.reason && r.reason.message === "gemini_busy");
-      await logEvent(deviceId, req.userId, "upload_failed", { reason: busy ? "ai_busy" : "all_passes_failed" });
-      return res.status(502).json({ error: busy
-        ? "Google's AI is very busy right now. Please wait a minute and try again — or add your subjects manually."
-        : "Couldn't analyze your documents right now. Please try again, or add your subjects manually." });
+      const scanned = backupErr && backupErr.message === "pdf_no_text";
+      await logEvent(deviceId, req.userId, "upload_failed", { reason: scanned ? "scanned_pdf_ai_busy" : "ai_unavailable" });
+      return res.status(503).json({ error: scanned
+        ? "ExamFlow AI is very busy right now and this PDF is a scan. Try again in a minute, or upload a photo (JPG/PNG) of the pages instead."
+        : "ExamFlow AI couldn't read your documents right now. Please try again in a minute." });
     }
 
     const merged = mergeExtractionPasses(succeeded);
@@ -849,15 +1006,106 @@ async function aiQuotaLeft(userId, kind) {
   return AI_LIMITS[kind] - Number(r.rows[0].n);
 }
 
-async function callGemini({ system, contents, json = false, temperature = 0.6, maxTokens = 1400 }) {
-  const j = await geminiGenerate({
-    systemInstruction: { parts: [{ text: system }] },
-    contents,
-    generationConfig: { temperature, maxOutputTokens: maxTokens, ...(json ? { responseMimeType: "application/json" } : {}) },
-  }, 45000);
-  const text = j?.candidates?.[0]?.content?.parts?.map((p) => p.text).filter(Boolean).join("") || "";
-  if (!text) throw new Error("gemini_empty_response");
-  return text;
+// ---- ExamFlow AI: built-in answers ----
+// Simple questions about the student's own plan are answered by ExamFlow itself from their saved data:
+// instant, never "busy", and they don't use the daily AI allowance. Anything else goes to the AI.
+const DONE_STATUSES = new Set(["completed", "mastered"]);
+const chapterStatus = (c) => c.status || (c.completed ? "completed" : "not_started");
+const STATUS_LABEL = { not_started: "not started", in_progress: "learning", completed: "completed", needs_revision: "needs revision", mastered: "mastered" };
+
+function daysUntil(dateStr) {
+  const d = new Date(dateStr);
+  if (Number.isNaN(d.getTime())) return null;
+  const today = new Date(); today.setHours(0, 0, 0, 0);
+  const day = new Date(d); day.setHours(0, 0, 0, 0);
+  return Math.round((day - today) / 86400000);
+}
+const niceDate = (dateStr) => new Date(dateStr).toLocaleDateString("en-IN", { day: "numeric", month: "short", timeZone: "Asia/Kolkata" });
+const inDays = (n) => (n === 0 ? "today" : n === 1 ? "tomorrow" : `in ${n} days`);
+
+function matchSubject(q, exams) {
+  const aliases = { maths: "math", mathematics: "math", sst: "social", "social science": "social", evs: "environment", bio: "biology", chem: "chemistry", phy: "physics", eng: "english", comp: "computer", cs: "computer" };
+  const norm = (s) => String(s || "").toLowerCase();
+  const expand = (s) => { let t = norm(s); Object.entries(aliases).forEach(([k, v]) => { t = t.replace(new RegExp(`\\b${k}\\b`, "g"), v); }); return t; };
+  const qx = expand(q);
+  return exams.find((e) => {
+    const sx = expand(e.subject).trim();
+    return sx && (qx.includes(sx) || sx.split(/\s+/).some((w) => w.length > 3 && qx.includes(w)));
+  }) || null;
+}
+
+function upcomingExams(exams) {
+  return exams
+    .filter((e) => e.examDate && daysUntil(e.examDate) !== null && daysUntil(e.examDate) >= 0)
+    .sort((a, b) => new Date(a.examDate) - new Date(b.examDate));
+}
+
+function studyTodayAnswer(exams) {
+  const picks = [];
+  exams.forEach((e) => {
+    const d = e.examDate ? daysUntil(e.examDate) : null;
+    if (d !== null && d < 0) return; // exam already over
+    (Array.isArray(e.chapters) ? e.chapters : []).forEach((c) => {
+      const st = chapterStatus(c);
+      if (DONE_STATUSES.has(st)) return;
+      const statusScore = st === "needs_revision" ? 3 : st === "in_progress" ? 2 : 1;
+      const dateScore = d === null ? 0 : d <= 3 ? 5 : d <= 7 ? 3.5 : d <= 14 ? 2 : 1;
+      const diffScore = c.difficulty === "Hard" ? 0.5 : 0;
+      picks.push({ e, c, st, d, score: statusScore + dateScore + diffScore });
+    });
+  });
+  if (!picks.length) return null;
+  picks.sort((a, b) => b.score - a.score);
+  const lines = picks.slice(0, 3).map(({ e, c, st, d }) =>
+    `- **${e.subject} — ${c.name}** (${STATUS_LABEL[st]}${d !== null ? `, exam ${inDays(d)}` : ""})`);
+  return `Here's what I'd focus on today, based on your chapters and exam dates:\n${lines.join("\n")}\n\nStart with the first one. Want me to explain it or quiz you on it?`;
+}
+
+function revisionAnswer(exams) {
+  const list = [];
+  exams.forEach((e) => (Array.isArray(e.chapters) ? e.chapters : []).forEach((c) => { if (chapterStatus(c) === "needs_revision") list.push(`- **${e.subject} — ${c.name}**`); }));
+  if (!list.length) return "Nothing is marked **Needs revision** right now. Nice! When you finish a chapter, use **Schedule Revision** so it comes back at the right time.";
+  return `These chapters need revision:\n${list.slice(0, 10).join("\n")}${list.length > 10 ? `\n- …and ${list.length - 10} more` : ""}\n\nPick one and I can help you revise it step by step.`;
+}
+
+function examDateAnswer(q, exams) {
+  const subj = matchSubject(q, exams);
+  if (subj) {
+    if (!subj.examDate) return `You haven't added an exam date for **${subj.subject}** yet. Add it in **Exams** and I'll count down for you.`;
+    const d = daysUntil(subj.examDate);
+    if (d < 0) return `Your **${subj.subject}** exam was on **${niceDate(subj.examDate)}**. It's already done.`;
+    return `Your **${subj.subject}** ${subj.examName || "exam"} is on **${niceDate(subj.examDate)}**, ${d === 0 ? "that's **today**. You've got this!" : `**${d} day${d === 1 ? "" : "s"}** to go.`}`;
+  }
+  const up = upcomingExams(exams);
+  if (!up.length) return exams.length ? "You don't have any upcoming exam dates. Add them in **Exams** whenever you know them." : null;
+  const lines = up.slice(0, 5).map((e) => { const d = daysUntil(e.examDate); return `- **${e.subject}**: ${niceDate(e.examDate)} (${d === 0 ? "today" : `${d} day${d === 1 ? "" : "s"} left`})`; });
+  return `Your upcoming exams:\n${lines.join("\n")}`;
+}
+
+function progressAnswer(exams) {
+  const rows = exams.map((e) => {
+    const ch = Array.isArray(e.chapters) ? e.chapters : [];
+    if (!ch.length) return null;
+    const done = ch.filter((c) => DONE_STATUSES.has(chapterStatus(c))).length;
+    return { s: e.subject, done, total: ch.length, pct: Math.round((done / ch.length) * 100) };
+  }).filter(Boolean);
+  if (!rows.length) return null;
+  const all = rows.reduce((a, r) => ({ done: a.done + r.done, total: a.total + r.total }), { done: 0, total: 0 });
+  const overall = Math.round((all.done / all.total) * 100);
+  const lines = rows.sort((a, b) => a.pct - b.pct).map((r) => `- **${r.s}**: ${r.done}/${r.total} chapters (${r.pct}%)`);
+  return `You've completed **${all.done} of ${all.total} chapters (${overall}%)** overall:\n${lines.join("\n")}\n\n${overall >= 70 ? "You're making solid progress!" : "Small progress beats no progress. Keep going!"}`;
+}
+
+function localAnswer(question, exams) {
+  const q = String(question || "").toLowerCase().trim();
+  if (!q || q.length > 90) return null; // longer questions need a real explanation
+  if (/\b(explain|teach|summar\w*|quiz|define|why|how does)\b/.test(q) || /\bwhat (is|are) (?!my\b)/.test(q)) return null;
+  const studyToday = /(what|which).{0,25}\b(study|focus on|start with|work on)\b.{0,20}\b(today|now|first|next|tonight)\b/.test(q) || /what should i (study|focus on|work on)\b/.test(q) || /study today|what to study|where (do|should) i start/.test(q);
+  if (studyToday && !/revis/.test(q)) return studyTodayAnswer(exams);
+  if (/revis/.test(q) && /(which|what|list|show|need|pending)/.test(q)) return revisionAnswer(exams);
+  if (/(when|how many days|days (left|until|till|to)|how long).{0,40}(exam|test|paper)|next exam|upcoming exam|my exams/.test(q)) return examDateAnswer(q, exams);
+  if (/my progress|how am i doing|how much.{0,20}(done|complete|finish|covered)|how far/.test(q)) return progressAnswer(exams);
+  return null;
 }
 
 // A compact summary of the student's own syllabus, used as context.
@@ -883,20 +1131,27 @@ const findChapter = (exams, examId, chapterId) => {
 
 app.post("/api/ai/chat", aiLimiter, requireAuth, async (req, res) => {
   try {
-    if (!GEMINI_API_KEY) return res.status(503).json({ error: "The AI assistant isn't set up yet." });
-    const left = await aiQuotaLeft(req.userId, "ai_chat");
-    if (left <= 0) return res.status(429).json({ error: "You've reached today's limit for the AI assistant. It resets tomorrow." });
     const body = req.body || {};
     const history = (Array.isArray(body.messages) ? body.messages : []).slice(-12)
       .filter((m) => m && typeof m.text === "string" && m.text.trim() && (m.role === "user" || m.role === "assistant"))
-      .map((m) => ({ role: m.role === "assistant" ? "model" : "user", parts: [{ text: m.text.slice(0, 2000) }] }));
+      .map((m) => ({ role: m.role, text: m.text.slice(0, 2000) }));
     if (!history.length || history[history.length - 1].role !== "user") return res.status(400).json({ error: "Type a question first." });
     const ctx = await studyContext(req.userId);
+    const lastQ = history[history.length - 1].text;
+    const quick = localAnswer(lastQ, ctx.exams);
+    if (quick) {
+      await logEvent(null, req.userId, "ai_chat_builtin", {});
+      return res.json({ reply: quick });
+    }
+    if (!AI_CONFIGURED) return res.status(503).json({ error: "ExamFlow AI isn't set up yet." });
+    const left = await aiQuotaLeft(req.userId, "ai_chat");
+    if (left <= 0) return res.status(429).json({ error: "You've reached today's limit for ExamFlow AI. It resets tomorrow." });
     const focus = body.focus && body.focus.examId ? findChapter(ctx.exams, body.focus.examId, body.focus.chapterId) : null;
     const focusLine = focus && focus.exam ? `\nThe student is currently asking about: ${focus.exam.subject}${focus.chapter ? ` — ${focus.chapter.name}` : ""}.` : "";
     const today = new Date().toISOString().slice(0, 10);
     const system =
-      `You are the ExamFlow Study Assistant, helping a school student learn and revise. Today is ${today}.\n` +
+      `You are ExamFlow AI, the study assistant built into ExamFlow, helping a school student learn and revise. Today is ${today}.\n` +
+      `Identity: if asked who made you, what model or AI you are, or which company powers you, say you are ExamFlow AI, ExamFlow's study assistant, and don't name any AI company or model.\n` +
       `Style: friendly, encouraging and clear; short paragraphs or brief bullet lists; plain language; keep answers under about 220 words unless the student asks for more. ` +
       `Use simple Markdown only (**bold**, bullet lists with "- ", numbered lists). No tables, no headings, no emojis overload.\n` +
       `Teaching: explain step by step and check understanding. When asked to quiz, ask one question at a time and wait for the answer. ` +
@@ -904,12 +1159,12 @@ app.post("/api/ai/chat", aiLimiter, requireAuth, async (req, res) => {
       `"What should I study today?": use the student's subjects below — prefer chapters that need revision, are still being learned, or have the nearest exam dates.\n` +
       `Stay on study-related topics. If a question isn't about studying, answer very briefly and steer back. Never help with cheating on a live test, and don't give harmful or adult content.\n` +
       `The student's subjects and chapters (their own data):\n${ctx.text}${focusLine}`;
-    const reply = await callGemini({ system, contents: history, temperature: 0.6, maxTokens: 1200 });
+    const reply = await aiGenerate({ system, messages: history, temperature: 0.6, maxTokens: 1200 });
     await logEvent(null, req.userId, "ai_chat", { chars: reply.length });
     res.json({ reply: reply.trim(), left: left - 1 });
   } catch (e) {
     console.error("ai chat error", e.message);
-    res.status(502).json({ error: "The assistant couldn't answer right now. Please try again in a moment." });
+    res.status(503).json({ error: "ExamFlow AI is very busy right now. Please try again in a minute." });
   }
 });
 
@@ -936,7 +1191,7 @@ function cleanQuiz(raw, count) {
 
 app.post("/api/ai/quiz", aiLimiter, requireAuth, async (req, res) => {
   try {
-    if (!GEMINI_API_KEY) return res.status(503).json({ error: "Practice quizzes aren't set up yet." });
+    if (!AI_CONFIGURED) return res.status(503).json({ error: "Practice quizzes aren't set up yet." });
     const left = await aiQuotaLeft(req.userId, "quiz_generated");
     if (left <= 0) return res.status(429).json({ error: "You've reached today's limit for practice quizzes. It resets tomorrow." });
     const body = req.body || {};
@@ -956,9 +1211,9 @@ app.post("/api/ai/quiz", aiLimiter, requireAuth, async (req, res) => {
       `Write ${count} ${QUIZ_TYPES[type]} at ${level} difficulty on ${topic ? `"${topic}"` : "the subject"}${subject ? ` (subject: ${subject})` : ""}.\n` +
       `JSON shape: {"title":"string","questions":[{"type":"mcq"|"tf"|"short","question":"string","options":["A","B","C","D"] (mcq only),` +
       `"answer": index of the correct option (mcq) | true/false (tf) | short model answer string (short),"explanation":"one or two sentences","topic":"the sub-topic this tests"}]}`;
-    const text = await callGemini({ system, contents: [{ role: "user", parts: [{ text: prompt }] }], json: true, temperature: 0.4, maxTokens: 3000 });
+    const text = await aiGenerate({ system, messages: [{ role: "user", text: prompt }], json: true, temperature: 0.4, maxTokens: 3000 });
     let parsed;
-    try { parsed = JSON.parse(text.replace(/^```json\s*|```\s*$/g, "").trim()); } catch (e) { throw new Error("quiz_parse_failed"); }
+    try { parsed = parseJsonLoose(text); } catch (e) { throw new Error("quiz_parse_failed"); }
     const questions = cleanQuiz(parsed, count);
     if (questions.length < 2) return res.status(502).json({ error: "Couldn't make a good quiz for that topic. Try again or pick another chapter." });
     await logEvent(null, req.userId, "quiz_generated", { type, count: questions.length });
@@ -968,7 +1223,7 @@ app.post("/api/ai/quiz", aiLimiter, requireAuth, async (req, res) => {
     });
   } catch (e) {
     console.error("ai quiz error", e.message);
-    res.status(502).json({ error: "Couldn't create a quiz right now. Please try again in a moment." });
+    res.status(503).json({ error: "ExamFlow AI is very busy right now, so the quiz couldn't be made. Please try again in a minute." });
   }
 });
 
@@ -1715,7 +1970,7 @@ app.get("/api/admin/health", requireAdmin, async (req, res) => {
     status: services.database.status !== "online" || services.auth.status !== "online" ? "critical" : anyOffline || errorCount24h > 20 ? "warning" : "healthy",
     services,
     databaseSizeBytes: dbSizeBytes,
-    smartImportConfigured: Boolean(GEMINI_API_KEY),
+    smartImportConfigured: AI_CONFIGURED,
     errorCount24h,
     recentErrors: errors,
   });

@@ -876,28 +876,45 @@ function subjectKey(name) {
   return SUBJECT_ALIASES[k] || k;
 }
 const ROMAN = { i: 1, ii: 2, iii: 3, iv: 4, v: 5, vi: 6, vii: 7, viii: 8, ix: 9, x: 10, xi: 11, xii: 12, xiii: 13, xiv: 14, xv: 15, xvi: 16, xvii: 17, xviii: 18, xix: 19, xx: 20 };
+const CH_WORD = "(?:chapter|chap|ch|unit|lesson|topic|module|part|lec|lecture)";
+const STOP = new Set(["the", "a", "an", "of", "and", "in", "to", "for", "on", "with", "its", "their", "our", "your", "&"]);
 function topicParts(t) {
-  let s = normalizeName(t).replace(/[‐-―]/g, "-");
+  let s = normalizeName(t).replace(/[‐-―]/g, "-").replace(/[’‘`]/g, "'");
+  // drop a leading section label: "BIOLOGY: Chapter 2 ...", "Physics - Ch 4 ...", "(Chemistry) Chapter 1 ..."
+  s = s.replace(new RegExp(`^\\(?[a-z][a-z .&/]{1,30}\\)?\\s*[:\\-|>]*\\s*(?=${CH_WORD}\\b)`, "i"), "");
+  s = s.replace(/^\(?[a-z][a-z .&/]{1,30}\)?\s*[:|>]\s*(?=\d)/i, "");
   let num = null;
-  const m = s.match(/^(?:chapter|chap|ch|unit|lesson|lesson no|topic|module|part)?\s*\.?\s*(?:no\.?\s*)?(\d{1,3}|[ivx]{1,5})\b\s*[-:.)–—]*\s*/i);
-  if (m && (/^\s*(chapter|chap|ch|unit|lesson|topic|module|part)/i.test(s) || /^\d/.test(s))) {
+  const m = s.match(new RegExp(`^(?:${CH_WORD})?\\s*[.:#-]?\\s*(?:no\\.?\\s*)?(\\d{1,3}|[ivx]{1,5})\\b\\s*[-:.)–—|]*\\s*`, "i"));
+  if (m && (new RegExp(`^\\s*${CH_WORD}(?=[\\s\\d.:#-]|$)`, "i").test(s) || /^\d/.test(s))) {
     num = /^\d+$/.test(m[1]) ? Number(m[1]) : (ROMAN[m[1].toLowerCase()] || null);
     if (num !== null) s = s.slice(m[0].length);
   }
-  const title = s.replace(/[^a-z0-9]/g, "");
-  return { num, title };
+  // drop a trailing section label too: "... (Biology)"
+  s = s.replace(/\s*\((?:biology|chemistry|physics|history|geography|civics|political science|economics|grammar|literature|reader|supplementary)\)\s*$/i, "");
+  const title = s.replace(/[^\p{L}\p{N}]/gu, "");
+  const words = new Set(s.split(/[^\p{L}\p{N}]+/u).filter((w) => w && !STOP.has(w)));
+  return { num, title, words };
+}
+function wordOverlap(a, b) {
+  if (!a.size || !b.size) return 0;
+  let common = 0;
+  a.forEach((w) => { if (b.has(w)) common += 1; });
+  return common / Math.min(a.size, b.size);
 }
 function sameTopic(a, b) {
-  if (a.title && b.title) {
-    if (a.title === b.title) return a.num === null || b.num === null || a.num === b.num;
-    const [short, long] = a.title.length <= b.title.length ? [a.title, b.title] : [b.title, a.title];
-    // one name is a cut-off copy of the other ("Measuring space: Perimeter and" vs "... and Area")
-    if (!long.startsWith(short)) return false;
-    if (a.num !== null && a.num === b.num) return short.length >= 4;
-    if (a.num === null || b.num === null) return short.length >= 15; // "Motion" and "Motion in a Plane" stay separate
-    return false;
-  }
-  return a.num !== null && a.num === b.num; // a bare "Chapter 3"
+  if (!a.title || !b.title) return a.num !== null && a.num === b.num; // a bare "Chapter 3"
+  if (a.num !== null && b.num !== null && a.num !== b.num) return false; // different chapter numbers
+  if (a.title === b.title) return true;
+  const [short, long] = a.title.length <= b.title.length ? [a.title, b.title] : [b.title, a.title];
+  const sameNum = a.num !== null && a.num === b.num;
+  // one name is a cut-off copy of the other ("Measuring space: Perimeter and" vs "... and Area")
+  if (long.startsWith(short) && short.length >= (sameNum ? 4 : 15)) return true;
+  // same chapter number with mostly the same words ("Cell - The building block of life" / "Cell: Building Blocks of Life")
+  const ov = wordOverlap(a.words, b.words);
+  if (sameNum && ov >= 0.6 && Math.min(a.words.size, b.words.size) >= 2) return true;
+  // no numbers, but nearly identical wording
+  if (!sameNum && Math.min(a.words.size, b.words.size) >= 3 && ov >= 0.9) return true;
+  return false;
 }
 function dedupeTopics(list) {
   const out = []; // { text, parts }
@@ -908,14 +925,19 @@ function dedupeTopics(list) {
     const hit = out.find((o) => sameTopic(o.parts, parts));
     if (hit) {
       // keep the fuller, better-formatted name
-      if (parts.title.length > hit.parts.title.length) { hit.text = text; hit.parts = parts; }
+      // keep the fuller name; for equal names keep the cleaner one (without a "BIOLOGY:" style label)
+      const startsClean = (x) => new RegExp(`^\\s*(${CH_WORD}|\\d)`, "i").test(x);
+      if (parts.title.length > hit.parts.title.length || (parts.title.length === hit.parts.title.length && startsClean(text) && !startsClean(hit.text))) { hit.text = text; hit.parts = parts; }
       continue;
     }
     out.push({ text, parts });
   }
   // put numbered chapters in chapter order (unnumbered ones keep their place at the end)
-  const allNumbered = out.length > 1 && out.every((o) => o.parts.num !== null);
-  if (allNumbered) out.sort((x, y) => x.parts.num - y.parts.num);
+  const numbered = out.filter((o) => o.parts.num !== null).length;
+  if (out.length > 1 && numbered >= Math.ceil(out.length * 0.6)) {
+    const pos = new Map(out.map((o, i) => [o, i]));
+    out.sort((x, y) => (x.parts.num ?? 1e6) - (y.parts.num ?? 1e6) || pos.get(x) - pos.get(y));
+  }
   return out.map((o) => o.text);
 }
 
